@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build output
+build/
+dist/
+*.exe
+
+# User configuration / local settings
+pdf_checker_settings.json
+
+# Environment / IDE
+.venv/
+venv/
+ENV/
+.env
+.vscode/
+.idea/
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
