@@ -55,7 +55,7 @@ except ImportError:
 
 # GitHub repo for updates
 GITHUB_REPO = "Brandon-Morision/pdf-error-checker-pro"  # Format: username/repo
-CURRENT_VERSION = "0.1.6"
+CURRENT_VERSION = "0.1.7"
 
 
 class RoundedButton(tk.Canvas):
