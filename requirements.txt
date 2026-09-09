@@ -1,7 +1,17 @@
-PyMuPDF>=1.23.0
-PyPDF2>=3.0.0
-pdfminer.six>=20221105
-python-docx>=1.1.0
-Pillow>=10.0.0
+# --- Core (the app cannot start without this) ---
+requests>=2.31.0
+
+# --- Recommended (the app runs without these, but scan accuracy and
+#     features degrade — see README "Requirements" section for exactly
+#     what each one enables and what happens if it's missing) ---
+PyMuPDF>=1.23.0          # resolution check + primary "missing information" check
+PyPDF2>=3.0.0            # corrupt-file check fallback + "missing information" fallback
+pdfminer.six>=20221105   # last-resort text extraction if PyMuPDF and PyPDF2 are both missing
+python-docx>=1.1.0       # required only for the "Export to Word" report
+
+# --- Optional (small UI/UX extras — app works fully without them) ---
+Pillow>=10.0.0           # smoother About-tab icon resizing (a plain PNG loader is used without it)
+plyer>=2.1.0             # non-blocking desktop notification on scan completion (falls back to a popup without it)
+
+# --- Build tooling only (not imported by the app itself, only needed for build_exe.bat) ---
 pyinstaller>=6.0.0
-requests>=2.31.0  # ← Add this

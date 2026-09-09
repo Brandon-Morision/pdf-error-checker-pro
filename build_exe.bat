@@ -20,7 +20,7 @@ pyinstaller --clean "pdf checker pro.spec"
 
 echo.
 echo ========================================
-if exist "dist\PDF_Error_Checker_Pro.exe" (
+if exist "dist\PDF Error Checker Pro.exe" (
     echo SUCCESS! EXE created in dist\ folder
     echo ========================================
 ) else (

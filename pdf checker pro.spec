@@ -35,7 +35,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='PDF_Error_Checker_Pro',
+    name='PDF Error Checker Pro',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
