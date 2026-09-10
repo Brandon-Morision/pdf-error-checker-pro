@@ -8,8 +8,11 @@ build/
 dist/
 *.exe
 
-# User configuration / local settings
+# User configuration / local settings / runtime logs & cache
 pdf_checker_settings.json
+pdf_checker_cache.json
+pdf_checker_history.json
+*.log
 
 # Environment / IDE
 .venv/

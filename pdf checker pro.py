@@ -4,10 +4,16 @@ import subprocess
 import threading
 import json
 import webbrowser
+import hashlib
+import logging
+import logging.handlers
+import tempfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 import requests
 
 # Use pymupdf instead of deprecated fitz
@@ -56,6 +62,43 @@ except ImportError:
 # GitHub repo for updates
 GITHUB_REPO = "Brandon-Morision/pdf-error-checker-pro"  # Format: username/repo
 CURRENT_VERSION = "0.1.7"
+
+# Known naming variations for the two target subfolders. Matching is always
+# case-insensitive; when "use_folder_aliases" is enabled in Settings, typing
+# any name in a group (in either the target-subfolders setting or on disk)
+# matches every other name in that same group. This keeps the app working
+# when a department renames "confidential" to "restricted", etc., without
+# requiring a code change.
+FOLDER_NAME_GROUPS = [
+    {"open", "opened", "openned", "public"},
+    {"confidential", "conf", "restricted", "private"},
+]
+
+
+def _setup_logger():
+    """File-based logging so failures are diagnosable after the fact —
+    especially once the app is running unattended for someone else and
+    nobody is watching a console window for stray print() output."""
+    logger = logging.getLogger("pdf_checker_pro")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        try:
+            log_path = Path(__file__).parent / "pdf_checker.log"
+            handler = logging.handlers.RotatingFileHandler(
+                log_path, maxBytes=1_000_000, backupCount=2, encoding="utf-8"
+            )
+            handler.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+            ))
+            logger.addHandler(handler)
+        except Exception:
+            # If the log file can't be created (e.g. read-only install dir),
+            # fall back to a null handler rather than raising on startup.
+            logger.addHandler(logging.NullHandler())
+    return logger
+
+
+logger = _setup_logger()
 
 
 class RoundedButton(tk.Canvas):
@@ -243,6 +286,16 @@ class Settings:
         "min_text_length": 50,
         "max_pages_check_resolution": 5,
         "auto_check_updates": True,
+        "target_subfolders": "open, confidential",
+        "use_folder_aliases": True,
+        "scan_mode": "project",
+        "check_password_protected": True,
+        "check_duplicates": True,
+        "enable_scan_cache": True,
+        "max_workers": 4,
+        "per_file_timeout_seconds": 30,
+        "auto_open_word_report": "ask",
+        "profiles": {},
         "last_folder": "",
         "window_width": 1200,
         "window_height": 850,
@@ -268,7 +321,7 @@ class Settings:
                 json.dump(settings_dict, f, indent=2)
             return True
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            logger.error(f"Error saving settings: {e}")
             return False
 
     def get(self, key, default=None):
@@ -276,6 +329,171 @@ class Settings:
 
     def set(self, key, value):
         self.settings[key] = value
+
+
+class ScanCache:
+    """Persists per-file scan results keyed by (size, mtime), so re-scanning
+    the same tree after only fixing a handful of files doesn't have to
+    re-run every check on files that haven't changed.
+
+    A cache hit also requires the current scan's settings ("signature") to
+    match what was in effect when the entry was recorded — if thresholds or
+    which checks are enabled have changed since, a stale hit could report
+    the wrong result, so we simply treat that as a miss and re-check.
+    """
+
+    def __init__(self):
+        self.cache_file = Path(__file__).parent / "pdf_checker_cache.json"
+        self.data = self._load()
+
+    def _load(self):
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load scan cache, starting fresh: {e}")
+                return {}
+        return {}
+
+    def save(self):
+        try:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.data, f)
+        except Exception as e:
+            logger.warning(f"Failed to save scan cache: {e}")
+
+    def get(self, path, size, mtime, signature):
+        entry = self.data.get(path)
+        if not entry:
+            return None
+        if entry.get("size") != size or entry.get("mtime") != mtime or entry.get("signature") != signature:
+            return None
+        return entry
+
+    def set(self, path, size, mtime, signature, errors, file_hash=None):
+        self.data[path] = {
+            "size": size, "mtime": mtime, "signature": signature,
+            "errors": errors, "hash": file_hash,
+        }
+
+    def prune_missing(self, valid_paths):
+        """Drop entries for files no longer in scope, so the cache file
+        doesn't grow forever as folders are renamed or files move/delete."""
+        stale = [p for p in self.data if p not in valid_paths]
+        for p in stale:
+            del self.data[p]
+
+
+class ScanHistory:
+    """A small local log of past scan runs (date, folder, mode, files
+    checked, errors found, duration) so results can be compared over time
+    without re-scanning."""
+
+    MAX_ENTRIES = 50
+
+    def __init__(self):
+        self.history_file = Path(__file__).parent / "pdf_checker_history.json"
+        self.entries = self._load()
+
+    def _load(self):
+        if self.history_file.exists():
+            try:
+                with open(self.history_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load scan history, starting fresh: {e}")
+                return []
+        return []
+
+    def add(self, entry):
+        self.entries.insert(0, entry)
+        self.entries = self.entries[: self.MAX_ENTRIES]
+        self._save()
+
+    def _save(self):
+        try:
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(self.entries, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to save scan history: {e}")
+
+
+class ScanHistoryDialog(tk.Toplevel):
+    """Read-only view of past scan runs, with an option to clear the log."""
+
+    def __init__(self, parent, history):
+        super().__init__(parent)
+        self.title("Scan History")
+        self.configure(bg="#f5f6fa")
+        self.transient(parent)
+        self.grab_set()
+        self.history = history
+
+        self._setup_ui()
+
+        self.update_idletasks()
+        w = max(760, self.winfo_reqwidth())
+        h = min(max(400, self.winfo_reqheight()), int(self.winfo_screenheight() * 0.8))
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(620, 350)
+
+    def _setup_ui(self):
+        main_frame = tk.Frame(self, bg="#f5f6fa", padx=20, pady=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(1, weight=1)
+
+        tk.Label(main_frame, text="Scan History", font=("Segoe UI", 16, "bold"),
+                 bg="#f5f6fa", fg="#2c3e50").grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+
+        columns = ("timestamp", "folder", "mode", "files", "errors", "duration")
+        headings = {"timestamp": "Date", "folder": "Folder", "mode": "Mode",
+                    "files": "Files Checked", "errors": "Errors Found", "duration": "Duration (s)"}
+        widths = {"timestamp": 150, "folder": 260, "mode": 110, "files": 90, "errors": 90, "duration": 90}
+
+        self.tree = ttk.Treeview(main_frame, columns=columns, show="headings")
+        for col in columns:
+            self.tree.heading(col, text=headings[col])
+            self.tree.column(col, width=widths[col], anchor=tk.W)
+        vsb = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=1, column=0, sticky=tk.NSEW)
+        vsb.grid(row=1, column=1, sticky=tk.NS)
+
+        self._populate()
+
+        button_frame = tk.Frame(main_frame, bg="#f5f6fa")
+        button_frame.grid(row=2, column=0, columnspan=2, sticky=tk.EW, pady=(15, 0))
+        RoundedButton(button_frame, text="Clear History", command=self._clear_history,
+                      bg="#e74c3c", fg="white", font=("Segoe UI", 10, "bold"),
+                      width=140, height=36).pack(side=tk.LEFT)
+        RoundedButton(button_frame, text="Close", command=self.destroy,
+                      bg="#95a5a6", fg="white", font=("Segoe UI", 10, "bold"),
+                      width=110, height=36).pack(side=tk.RIGHT)
+
+    def _populate(self):
+        self.tree.delete(*self.tree.get_children())
+        if not self.history.entries:
+            self.tree.insert("", tk.END, values=("No scans recorded yet.", "", "", "", "", ""))
+            return
+        for entry in self.history.entries:
+            mode_label = "All PDFs" if entry.get("scan_mode") == "all" else "Project"
+            if entry.get("cancelled"):
+                mode_label += " (cancelled)"
+            self.tree.insert("", tk.END, values=(
+                entry.get("timestamp", ""), entry.get("folder", ""), mode_label,
+                entry.get("files_checked", 0), entry.get("errors_found", 0),
+                entry.get("duration_seconds", 0),
+            ))
+
+    def _clear_history(self):
+        if messagebox.askyesno("Clear History", "Remove all recorded scan history?", parent=self):
+            self.history.entries = []
+            self.history._save()
+            self._populate()
 
 
 class UpdateChecker:
@@ -289,15 +507,21 @@ class UpdateChecker:
     def check_for_updates(self):
         """Check if new version is available."""
         try:
-            response = requests.get(self.api_url, timeout=5)
+            headers = {
+                "User-Agent": f"PDF-Error-Checker-Pro/{self.current_version}",
+                "Accept": "application/vnd.github.v3+json",
+            }
+            response = requests.get(self.api_url, headers=headers, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                latest_version = data.get('tag_name', '').lstrip('v')
+                latest_version = (data.get('tag_name') or '').lstrip('v')
                 if latest_version:
                     return self.compare_versions(latest_version, self.current_version), latest_version, data
+            elif response.status_code != 404:
+                logger.info(f"Update check returned HTTP status {response.status_code}")
             return False, None, None
         except Exception as e:
-            print(f"Update check failed: {e}")
+            logger.warning(f"Update check failed: {e}")
             return False, None, None
 
     def compare_versions(self, latest, current):
@@ -316,6 +540,43 @@ class UpdateChecker:
         except Exception:
             return False
 
+    @staticmethod
+    def find_installable_asset(release_data):
+        """Picks a release asset this build can actually install
+        automatically, or None if there isn't one — in which case the
+        caller should fall back to opening the release page for the user
+        to download manually.
+
+        - Running as a frozen PyInstaller .exe on Windows: look for a
+          '.exe' asset (self-replace via a relaunching helper script).
+        - Running from source (.py) on any OS: look for a '.py' asset
+          (direct overwrite + relaunch — no file-lock issues to work
+          around, since Python doesn't hold the script file open).
+        - Anything else (e.g. a frozen build on macOS/Linux, or a release
+          with no matching asset): no automatic path is supported yet.
+        """
+        assets = release_data.get("assets") or []
+        is_frozen = getattr(sys, "frozen", False)
+
+        if is_frozen and sys.platform.startswith("win"):
+            wanted_ext = ".exe"
+        elif not is_frozen:
+            wanted_ext = ".py"
+        else:
+            return None
+
+        candidates = [a for a in assets if a.get("name", "").lower().endswith(wanted_ext)]
+        if not candidates:
+            return None
+        # Prefer a name that mentions "windows"/"win" when there are several
+        # exe assets (e.g. a repo also publishing a mac/linux build), else
+        # just take the first match.
+        for a in candidates:
+            name_lower = a.get("name", "").lower()
+            if "win" in name_lower:
+                return a
+        return candidates[0]
+
 
 class SettingsDialog(tk.Toplevel):
     """Professional settings dialog with rounded corners."""
@@ -323,21 +584,40 @@ class SettingsDialog(tk.Toplevel):
     def __init__(self, parent, settings):
         super().__init__(parent)
         self.title("Settings")
-        # No fixed 700px height: the notebook is no longer forced to expand
-        # to fill it, so the window sizes closer to its actual content and
-        # the action buttons sit right under the tabs instead of stranded
-        # at the bottom of empty space.
-        self.geometry("650x560")
-        self.minsize(560, 460)
         self.transient(parent)
         self.grab_set()
         self.configure(bg="#f5f6fa")
 
         self.settings = settings
         self.modified_settings = settings.settings.copy()
+        self._scrollable_canvases = []
 
         self.setup_ui()
+        self._finalize_scrollable_widths()
+        # Size the window to fit what's actually inside it (the Scan Settings
+        # tab grows over time as options are added, so a hardcoded geometry
+        # eventually clips the action buttons below the visible area and the
+        # user has to manually resize to see Save/Cancel/Reset). Measuring
+        # the real required size after layout, capped to a sane min/max,
+        # keeps the buttons visible immediately no matter how tall the
+        # tallest tab gets.
+        self._apply_auto_size()
         self.center_window()
+
+    def _apply_auto_size(self):
+        self.update_idletasks()
+        min_w, min_h = 560, 420
+        req_w = max(min_w, self.winfo_reqwidth())
+        req_h = max(min_h, self.winfo_reqheight())
+        # Never spawn taller/wider than the screen — fall back to scrolling
+        # within tabs (the About tab already supports this) rather than an
+        # oversized window on small displays.
+        max_h = int(self.winfo_screenheight() * 0.85)
+        max_w = int(self.winfo_screenwidth() * 0.9)
+        width = min(req_w, max_w)
+        height = min(req_h, max_h)
+        self.geometry(f"{width}x{height}")
+        self.minsize(min_w, min_h)
 
     def center_window(self):
         self.update_idletasks()
@@ -349,20 +629,26 @@ class SettingsDialog(tk.Toplevel):
         main_frame = tk.Frame(self, bg="#f5f6fa", padx=20, pady=20)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        # Grid (not pack) for the top-level layout: the button row is a
+        # fixed-height grid row that always renders in full, while the
+        # notebook is the only row allowed to grow or shrink. This means
+        # Save/Cancel/Reset can never end up pushed below the visible
+        # window, even as tabs grow (e.g. new Scan Settings options) or the
+        # user manually resizes the dialog smaller.
+        main_frame.grid_columnconfigure(0, weight=1)
+        main_frame.grid_rowconfigure(1, weight=1)
+
         tk.Label(main_frame, text="Application Settings", font=("Segoe UI", 18, "bold"),
-                bg="#f5f6fa", fg="#2c3e50").pack(anchor=tk.W, pady=(0, 15))
+                bg="#f5f6fa", fg="#2c3e50").grid(row=0, column=0, sticky=tk.W, pady=(0, 15))
 
         self.notebook = notebook = ttk.Notebook(main_frame)
-        # fill=X (not BOTH/expand) so the notebook takes only the height its
-        # content needs, keeping Save/Cancel close beneath it instead of
-        # being pushed to the bottom of a mostly-empty dialog.
-        notebook.pack(fill=tk.X, pady=(0, 15))
+        notebook.grid(row=1, column=0, sticky=tk.NSEW, pady=(0, 15))
 
         general_frame = tk.Frame(notebook, bg="#f5f6fa", padx=20, pady=20)
         notebook.add(general_frame, text="  General  ")
         self.setup_general_tab(general_frame)
 
-        scan_frame = tk.Frame(notebook, bg="#f5f6fa", padx=20, pady=20)
+        scan_frame = tk.Frame(notebook, bg="#f5f6fa")
         notebook.add(scan_frame, text="  Scan Settings  ")
         self.setup_scan_tab(scan_frame)
 
@@ -370,11 +656,11 @@ class SettingsDialog(tk.Toplevel):
         notebook.add(about_frame, text="  About  ")
         self.setup_about_tab(about_frame)
 
-        # Action buttons live in their own row directly under the tabs, and
-        # are hidden while the About tab is showing — About is read-only
-        # reference material, not something to Save/Cancel.
+        # Action buttons live in their own fixed row directly under the
+        # tabs, and are hidden while the About tab is showing — About is
+        # read-only reference material, not something to Save/Cancel.
         self.button_frame = tk.Frame(main_frame, bg="#f5f6fa")
-        self.button_frame.pack(fill=tk.X)
+        self.button_frame.grid(row=2, column=0, sticky=tk.EW)
 
         RoundedButton(self.button_frame, text="Reset to Defaults", command=self.reset_defaults,
                       bg="#95a5a6", fg="white", font=("Segoe UI", 10, "bold"),
@@ -393,9 +679,70 @@ class SettingsDialog(tk.Toplevel):
     def _on_tab_changed(self, _event=None):
         current_tab_text = self.notebook.tab(self.notebook.select(), "text").strip()
         if current_tab_text == "About":
-            self.button_frame.pack_forget()
+            # grid_remove (not grid_forget) preserves this widget's grid
+            # options so restoring it below doesn't need to respecify them.
+            self.button_frame.grid_remove()
         else:
-            self.button_frame.pack(fill=tk.X)
+            self.button_frame.grid()
+
+    def _make_scrollable(self, parent, padx=20, pady=20, bg="#f5f6fa"):
+        """Wrap a notebook tab's content in a scrolling canvas so it stays
+        usable as more sections get added over time, instead of the dialog
+        having to keep growing (or clipping content) forever.
+
+        A plain tk.Canvas does NOT propagate its embedded window's natural
+        size the way a Frame would, so left alone, the outer dialog's
+        auto-sizing (which measures widget request sizes) would undersize
+        itself and squeeze this tab's content narrower than it needs. The
+        canvas's own width is set explicitly from the inner frame's real
+        required width once all of its children exist — see
+        _finalize_scrollable_widths(), called after setup_ui() builds every
+        tab and before the dialog computes its final geometry.
+        """
+        canvas = tk.Canvas(parent, bg=bg, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        inner = tk.Frame(canvas, bg=bg, padx=padx, pady=pady)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _update_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _resize_inner(event):
+            # Only ever grow the inner frame to fill extra space — never
+            # shrink it below its own natural width, which would squeeze
+            # or clip its children with no way to reach the rest.
+            target_width = max(event.width, inner.winfo_reqwidth())
+            canvas.itemconfigure(inner_id, width=target_width)
+
+        inner.bind("<Configure>", _update_scrollregion)
+        canvas.bind("<Configure>", _resize_inner)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self._scrollable_canvases.append(canvas)
+        return inner
+
+    def _finalize_scrollable_widths(self):
+        """Called once, after every tab's content has been built: sizes
+        each scrollable tab's canvas to its content's real required width,
+        so the dialog's own auto-sizing (measured right after this) accounts
+        for the widest tab correctly instead of an arbitrary default."""
+        for canvas in self._scrollable_canvases:
+            canvas.update_idletasks()
+            for item in canvas.find_all():
+                inner_name = canvas.itemcget(item, "window")
+                if inner_name:
+                    inner = canvas.nametowidget(inner_name)
+                    canvas.configure(width=inner.winfo_reqwidth())
+                    break
 
     def setup_general_tab(self, parent):
         size_frame = tk.LabelFrame(parent, text="Window Size", font=("Segoe UI", 11, "bold"),
@@ -426,7 +773,37 @@ class SettingsDialog(tk.Toplevel):
                       variable=self.auto_update_var, font=("Segoe UI", 10),
                       bg="#ffffff", selectcolor="#ffffff").pack(anchor=tk.W, pady=5)
 
+        cache_frame = tk.LabelFrame(parent, text="Scan Cache", font=("Segoe UI", 11, "bold"),
+                                    bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
+        cache_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self.enable_cache_var = tk.BooleanVar(value=self.settings.get("enable_scan_cache", True))
+        cache_cb = tk.Checkbutton(cache_frame,
+                      text="Skip re-checking unchanged files (cache by file size + modified time)",
+                      variable=self.enable_cache_var, font=("Segoe UI", 10),
+                      bg="#ffffff", selectcolor="#ffffff", wraplength=480, justify=tk.LEFT)
+        cache_cb.pack(anchor=tk.W, pady=(0, 10))
+        Tooltip(cache_cb, "If a file's size and modified-date haven't changed since the last "
+                          "scan (with the same settings), its previous result is reused instead "
+                          "of re-checking it.")
+
+        RoundedButton(cache_frame, text="Clear Cache", command=self._clear_cache,
+                      bg="#95a5a6", fg="white", font=("Segoe UI", 9, "bold"),
+                      width=130, height=32).pack(anchor=tk.W)
+
+    def _clear_cache(self):
+        cache_path = Path(__file__).parent / "pdf_checker_cache.json"
+        try:
+            if cache_path.exists():
+                cache_path.unlink()
+            messagebox.showinfo("Cache Cleared", "The scan cache has been cleared. "
+                                "The next scan will re-check every file.", parent=self)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not clear cache:\n{e}", parent=self)
+
     def setup_scan_tab(self, parent):
+        parent = self._make_scrollable(parent, padx=20, pady=20)
+
         if not FITZ_AVAILABLE:
             warn = tk.Label(
                 parent,
@@ -437,6 +814,63 @@ class SettingsDialog(tk.Toplevel):
                 wraplength=520, justify=tk.LEFT,
             )
             warn.pack(fill=tk.X, pady=(0, 15))
+
+        profile_frame = tk.LabelFrame(parent, text="Scan Profiles", font=("Segoe UI", 11, "bold"),
+                                      bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
+        profile_frame.pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(profile_frame,
+                 text="Save and reload named sets of thresholds and target subfolders for "
+                      "different clients or project types.",
+                 font=("Segoe UI", 9), bg="#ffffff", fg="#7f8c8d", wraplength=520,
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+
+        profile_row = tk.Frame(profile_frame, bg="#ffffff")
+        profile_row.pack(fill=tk.X)
+
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(profile_row, textvariable=self.profile_var, state="readonly",
+                                          values=list(self.settings.get("profiles", {}).keys()), width=20)
+        self.profile_combo.pack(side=tk.LEFT, padx=(0, 8))
+
+        RoundedButton(profile_row, text="Load", command=self._load_profile,
+                      bg="#3498db", fg="white", font=("Segoe UI", 9, "bold"),
+                      width=80, height=32).pack(side=tk.LEFT, padx=(0, 6))
+        RoundedButton(profile_row, text="Save As...", command=self._save_profile_as,
+                      bg="#27ae60", fg="white", font=("Segoe UI", 9, "bold"),
+                      width=100, height=32).pack(side=tk.LEFT, padx=(0, 6))
+        RoundedButton(profile_row, text="Delete", command=self._delete_profile,
+                      bg="#e74c3c", fg="white", font=("Segoe UI", 9, "bold"),
+                      width=80, height=32).pack(side=tk.LEFT)
+
+        folder_names_frame = tk.LabelFrame(parent, text="Target Subfolders", font=("Segoe UI", 11, "bold"),
+                                           bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
+        folder_names_frame.pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(folder_names_frame,
+                 text="Comma-separated subfolder names to scan for (used in Project Structure mode):",
+                 font=("Segoe UI", 9), bg="#ffffff", fg="#7f8c8d", wraplength=520,
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
+
+        self.target_subfolders_var = tk.StringVar(
+            value=self.settings.get("target_subfolders", "open, confidential"))
+        target_entry = tk.Entry(folder_names_frame, textvariable=self.target_subfolders_var,
+                                font=("Segoe UI", 10))
+        target_entry.pack(fill=tk.X, pady=(0, 8))
+        Tooltip(target_entry, "e.g. 'open, confidential' or 'public, internal'. "
+                              "A project folder is scanned if it contains at least one of these.")
+
+        self.use_aliases_var = tk.BooleanVar(value=self.settings.get("use_folder_aliases", True))
+        tk.Checkbutton(folder_names_frame,
+                      text="Also match common naming variations (opened, public, conf, restricted, private, etc.)",
+                      variable=self.use_aliases_var, font=("Segoe UI", 9), bg="#ffffff", fg="#34495e",
+                      selectcolor="#ffffff", wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+
+        tk.Label(folder_names_frame,
+                 text="Matching is always case-insensitive, and a project folder no longer needs "
+                      "every target subfolder to be scanned — just one.",
+                 font=("Segoe UI", 8, "italic"), bg="#ffffff", fg="#95a5a6", wraplength=520,
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
 
         res_frame = tk.LabelFrame(parent, text="Resolution Check", font=("Segoe UI", 11, "bold"),
                                   bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
@@ -470,33 +904,93 @@ class SettingsDialog(tk.Toplevel):
         tk.Spinbox(text_frame, from_=0.1, to=1.0, increment=0.05, textvariable=self.empty_ratio_var,
                   font=("Segoe UI", 10), width=10, state="readonly").grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
 
+        perf_frame = tk.LabelFrame(parent, text="Performance", font=("Segoe UI", 11, "bold"),
+                                   bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
+        perf_frame.pack(fill=tk.X, pady=(0, 15))
+
+        tk.Label(perf_frame, text="Parallel workers:", font=("Segoe UI", 10), bg="#ffffff",
+                 fg="#34495e").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.max_workers_var = tk.IntVar(value=self.settings.get("max_workers", 4))
+        workers_spin = tk.Spinbox(perf_frame, from_=1, to=16, textvariable=self.max_workers_var,
+                  font=("Segoe UI", 10), width=10, state="readonly")
+        workers_spin.grid(row=0, column=1, sticky=tk.W, padx=10, pady=5)
+        Tooltip(workers_spin, "How many PDFs to check at once. Higher values speed up large "
+                              "folders on multi-core machines, but too many can thrash a slow disk.")
+
+        tk.Label(perf_frame, text="Per-file timeout (sec):", font=("Segoe UI", 10), bg="#ffffff",
+                 fg="#34495e").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.per_file_timeout_var = tk.IntVar(value=self.settings.get("per_file_timeout_seconds", 30))
+        timeout_spin = tk.Spinbox(perf_frame, from_=5, to=300, textvariable=self.per_file_timeout_var,
+                  font=("Segoe UI", 10), width=10, state="readonly")
+        timeout_spin.grid(row=1, column=1, sticky=tk.W, padx=10, pady=5)
+        Tooltip(timeout_spin, "If a single PDF takes longer than this to check, it's marked "
+                              "'Scan Timeout' and the scan moves on instead of stalling on it.")
+
+    def _profile_values_from_ui(self):
+        return {
+            "resolution_threshold": self.resolution_var.get(),
+            "max_pages_check_resolution": self.max_pages_var.get(),
+            "min_text_length": self.min_text_var.get(),
+            "empty_page_threshold": self.empty_ratio_var.get(),
+            "target_subfolders": self.target_subfolders_var.get(),
+            "use_folder_aliases": self.use_aliases_var.get(),
+        }
+
+    def _apply_profile_values(self, values):
+        self.resolution_var.set(values.get("resolution_threshold", self.resolution_var.get()))
+        self.max_pages_var.set(values.get("max_pages_check_resolution", self.max_pages_var.get()))
+        self.min_text_var.set(values.get("min_text_length", self.min_text_var.get()))
+        self.empty_ratio_var.set(values.get("empty_page_threshold", self.empty_ratio_var.get()))
+        self.target_subfolders_var.set(values.get("target_subfolders", self.target_subfolders_var.get()))
+        self.use_aliases_var.set(values.get("use_folder_aliases", self.use_aliases_var.get()))
+
+    def _persist_profiles(self, profiles):
+        # Profiles are saved immediately, independent of the dialog's normal
+        # Save/Cancel flow — a saved profile shouldn't vanish just because
+        # the user later cancels an unrelated threshold edit.
+        self.modified_settings["profiles"] = profiles
+        self.settings.settings["profiles"] = profiles
+        self.settings.save(self.settings.settings)
+        self.profile_combo.configure(values=list(profiles.keys()))
+
+    def _save_profile_as(self):
+        name = simpledialog.askstring("Save Profile", "Profile name:", parent=self)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        profiles = dict(self.settings.get("profiles", {}))
+        profiles[name] = self._profile_values_from_ui()
+        self._persist_profiles(profiles)
+        self.profile_var.set(name)
+        messagebox.showinfo("Profile Saved", f"Saved profile '{name}'.", parent=self)
+
+    def _load_profile(self):
+        name = self.profile_var.get()
+        if not name:
+            messagebox.showwarning("No Profile Selected", "Choose a profile to load first.", parent=self)
+            return
+        values = self.settings.get("profiles", {}).get(name)
+        if values is None:
+            messagebox.showerror("Not Found", f"Profile '{name}' no longer exists.", parent=self)
+            return
+        self._apply_profile_values(values)
+
+    def _delete_profile(self):
+        name = self.profile_var.get()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete Profile", f"Delete profile '{name}'?", parent=self):
+            return
+        profiles = dict(self.settings.get("profiles", {}))
+        profiles.pop(name, None)
+        self._persist_profiles(profiles)
+        self.profile_var.set("")
+
     def setup_about_tab(self, parent):
-        # Wrapped in a canvas + scrollbar so the About content can scroll if
-        # it ever grows past the available height, instead of being clipped
-        # or forcing the whole dialog taller.
-        canvas = tk.Canvas(parent, bg="#ffffff", highlightthickness=0)
-        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        info_frame = tk.Frame(canvas, bg="#ffffff", padx=20, pady=20)
-        info_frame_id = canvas.create_window((0, 0), window=info_frame, anchor="nw")
-
-        def _update_scrollregion(_event=None):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-
-        def _resize_inner(event):
-            canvas.itemconfigure(info_frame_id, width=event.width)
-
-        info_frame.bind("<Configure>", _update_scrollregion)
-        canvas.bind("<Configure>", _resize_inner)
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Wrapped in a canvas + scrollbar (via the shared helper) so the
+        # About content can scroll if it ever grows past the available
+        # height, instead of being clipped or forcing the whole dialog taller.
+        info_frame = self._make_scrollable(parent, padx=20, pady=20, bg="#ffffff")
 
         tk.Label(info_frame, text="PDF Error Checker Pro", font=("Segoe UI", 16, "bold"),
                  bg="#ffffff", fg="#2c3e50").pack(pady=(0, 5))
@@ -528,7 +1022,7 @@ class SettingsDialog(tk.Toplevel):
                     icon_label.image = self.about_icon
                     icon_label.pack(pady=(2, 6))
             except Exception as e:
-                print(f"Error loading about icon: {e}")
+                logger.warning(f"Error loading about icon: {e}")
 
         tk.Label(info_frame, text=f"Version {CURRENT_VERSION}", font=("Segoe UI", 10),
                  bg="#ffffff", fg="#7f8c8d").pack(pady=(0, 10))
@@ -561,7 +1055,9 @@ class SettingsDialog(tk.Toplevel):
 
     def reset_defaults(self):
         if messagebox.askyesno("Reset Settings", "Are you sure?", parent=self):
+            existing_profiles = self.modified_settings.get("profiles", {})
             self.modified_settings = Settings.DEFAULT_SETTINGS.copy()
+            self.modified_settings["profiles"] = existing_profiles
             self.load_current_values()
             messagebox.showinfo("Reset Complete", "Settings reset to defaults.", parent=self)
 
@@ -573,6 +1069,11 @@ class SettingsDialog(tk.Toplevel):
         self.min_text_var.set(self.modified_settings.get("min_text_length", 50))
         self.empty_ratio_var.set(self.modified_settings.get("empty_page_threshold", 0.8))
         self.auto_update_var.set(self.modified_settings.get("auto_check_updates", True))
+        self.target_subfolders_var.set(self.modified_settings.get("target_subfolders", "open, confidential"))
+        self.use_aliases_var.set(self.modified_settings.get("use_folder_aliases", True))
+        self.enable_cache_var.set(self.modified_settings.get("enable_scan_cache", True))
+        self.max_workers_var.set(self.modified_settings.get("max_workers", 4))
+        self.per_file_timeout_var.set(self.modified_settings.get("per_file_timeout_seconds", 30))
 
     def save(self):
         self.modified_settings["window_width"] = self.width_var.get()
@@ -582,6 +1083,11 @@ class SettingsDialog(tk.Toplevel):
         self.modified_settings["min_text_length"] = self.min_text_var.get()
         self.modified_settings["empty_page_threshold"] = self.empty_ratio_var.get()
         self.modified_settings["auto_check_updates"] = self.auto_update_var.get()
+        self.modified_settings["target_subfolders"] = self.target_subfolders_var.get()
+        self.modified_settings["use_folder_aliases"] = self.use_aliases_var.get()
+        self.modified_settings["enable_scan_cache"] = self.enable_cache_var.get()
+        self.modified_settings["max_workers"] = self.max_workers_var.get()
+        self.modified_settings["per_file_timeout_seconds"] = self.per_file_timeout_var.get()
 
         if self.settings.save(self.modified_settings):
             self.settings.settings = self.modified_settings.copy()
@@ -620,13 +1126,17 @@ class PDFErrorChecker:
         self.folder_path = tk.StringVar(value=self.settings.get("last_folder", ""))
         self.results = []
         self.running = False
+        self.has_scanned = False
         self.scan_start_time = None
         self.scan_thread = None
+        self.scan_cache = ScanCache()
+        self.scan_history = ScanHistory()
 
         self.export_button = None
         self.scan_button = None
         self.cancel_button = None
         self.settings_button = None
+        self.history_button = None
 
         self.setup_ui()
         self.center_window()
@@ -713,19 +1223,209 @@ class PDFErrorChecker:
     def _handle_update_result(self, result):
         # Runs on the main thread — safe to touch Tk widgets here.
         has_update, latest, data = result
-        if has_update and data:
-            release_url = data.get('html_url', '')
-            release_notes = data.get('body') or 'No release notes available.'
+        if not (has_update and data):
+            return
 
-            msg = (f"A new version ({latest}) is available!\n\n"
-                  f"Current version: {CURRENT_VERSION}\n"
-                  f"Latest version: {latest}\n\n"
-                  f"Release notes:\n{release_notes[:500]}\n\n"
-                  f"Would you like to download it now?")
+        release_url = data.get('html_url', '')
+        release_notes = data.get('body') or 'No release notes available.'
+        asset = UpdateChecker.find_installable_asset(data)
 
-            if messagebox.askyesno("Update Available", msg):
-                if release_url:
-                    webbrowser.open(release_url)
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Update Available")
+        dialog.configure(bg="#f5f6fa")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = tk.Frame(dialog, bg="#f5f6fa", padx=25, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame, text=f"A new version ({latest}) is available.",
+                 font=("Segoe UI", 12, "bold"), bg="#f5f6fa", fg="#2c3e50").pack(anchor=tk.W)
+        tk.Label(frame, text=f"You have {CURRENT_VERSION}.", font=("Segoe UI", 9),
+                 bg="#f5f6fa", fg="#7f8c8d").pack(anchor=tk.W, pady=(0, 10))
+
+        notes_frame = tk.Frame(frame, bg="#ffffff", padx=10, pady=8)
+        notes_frame.pack(fill=tk.X, pady=(0, 15))
+        tk.Label(notes_frame, text=release_notes[:500], font=("Segoe UI", 9), bg="#ffffff",
+                 fg="#34495e", wraplength=400, justify=tk.LEFT).pack(anchor=tk.W)
+
+        if not asset:
+            tk.Label(frame, text="No auto-installable update is available for this build — "
+                                 "you'll need to download it yourself.",
+                     font=("Segoe UI", 8, "italic"), bg="#f5f6fa", fg="#95a5a6",
+                     wraplength=400, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
+
+        btn_row = tk.Frame(frame, bg="#f5f6fa")
+        btn_row.pack(fill=tk.X)
+
+        def close_and(fn=None):
+            dialog.destroy()
+            if fn:
+                fn()
+
+        if asset:
+            RoundedButton(btn_row, text="Download && Install", bg="#27ae60", fg="white",
+                          font=("Segoe UI", 10, "bold"), width=170, height=36,
+                          command=lambda: close_and(lambda: self._start_update_download(latest, asset))
+                          ).pack(side=tk.RIGHT)
+        else:
+            RoundedButton(btn_row, text="Open Release Page", bg="#3498db", fg="white",
+                          font=("Segoe UI", 10, "bold"), width=170, height=36,
+                          command=lambda: close_and(lambda: webbrowser.open(release_url) if release_url else None)
+                          ).pack(side=tk.RIGHT)
+
+        RoundedButton(btn_row, text="Later", bg="#95a5a6", fg="white",
+                      font=("Segoe UI", 10, "bold"), width=90, height=36,
+                      command=lambda: close_and()).pack(side=tk.RIGHT, padx=(0, 10))
+
+        if asset and release_url:
+            RoundedButton(btn_row, text="View Release Page", bg="#f5f6fa", fg="#3498db",
+                          font=("Segoe UI", 9), width=150, height=36,
+                          command=lambda: webbrowser.open(release_url)).pack(side=tk.LEFT)
+
+        dialog.update_idletasks()
+        w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        x = (dialog.winfo_screenwidth() - w) // 2
+        y = (dialog.winfo_screenheight() - h) // 2
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _start_update_download(self, latest_version, asset):
+        """Downloads the release asset in the background with a progress
+        dialog, then hands off to the platform-appropriate installer."""
+        download_url = asset.get("browser_download_url")
+        total_size = asset.get("size") or 0
+        if not download_url:
+            messagebox.showerror("Update Failed", "The release asset has no download URL.")
+            return
+
+        progress_dialog = tk.Toplevel(self.root)
+        progress_dialog.title("Downloading Update")
+        progress_dialog.configure(bg="#f5f6fa")
+        progress_dialog.transient(self.root)
+        progress_dialog.resizable(False, False)
+        progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)  # no closing mid-download
+
+        frame = tk.Frame(progress_dialog, bg="#f5f6fa", padx=25, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+        status_label = tk.Label(frame, text=f"Downloading version {latest_version}...",
+                                font=("Segoe UI", 10), bg="#f5f6fa", fg="#2c3e50")
+        status_label.pack(anchor=tk.W, pady=(0, 10))
+        bar = ttk.Progressbar(frame, orient=tk.HORIZONTAL, length=320,
+                              mode="determinate" if total_size else "indeterminate")
+        bar.pack(fill=tk.X)
+        if not total_size:
+            bar.start(15)
+
+        progress_dialog.update_idletasks()
+        w, h = progress_dialog.winfo_reqwidth(), progress_dialog.winfo_reqheight()
+        x = (progress_dialog.winfo_screenwidth() - w) // 2
+        y = (progress_dialog.winfo_screenheight() - h) // 2
+        progress_dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        def worker():
+            try:
+                temp_dir = Path(tempfile.gettempdir())
+                dest_path = temp_dir / asset.get("name", f"pdf_checker_update_{latest_version}")
+                downloaded = 0
+                headers = {"User-Agent": f"PDF-Error-Checker-Pro/{CURRENT_VERSION}"}
+                with requests.get(download_url, headers=headers, stream=True, timeout=30) as resp:
+                    resp.raise_for_status()
+                    with open(dest_path, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_size:
+                                    pct = downloaded / total_size
+                                    self.root.after(0, lambda p=pct: bar.config(value=p * 100))
+
+                if downloaded == 0:
+                    raise IOError("Downloaded file is empty.")
+
+                logger.info(f"Update {latest_version} downloaded to {dest_path} ({downloaded} bytes)")
+                self.root.after(0, lambda: self._install_downloaded_update(progress_dialog, dest_path, latest_version))
+            except Exception as e:
+                logger.error(f"Update download failed: {e}")
+                self.root.after(0, lambda: self._update_failed(progress_dialog, str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_failed(self, progress_dialog, error_text):
+        progress_dialog.destroy()
+        messagebox.showerror("Update Failed",
+                             f"Couldn't download the update automatically:\n{error_text}\n\n"
+                             "You can still download it manually from the release page.")
+
+    def _install_downloaded_update(self, progress_dialog, downloaded_path, latest_version):
+        progress_dialog.destroy()
+        if not messagebox.askyesno(
+            "Ready to Install",
+            f"Version {latest_version} has been downloaded.\n\n"
+            "The app will close and restart automatically to finish installing. "
+            "Save any work first.\n\nInstall now?"
+        ):
+            return
+
+        try:
+            if getattr(sys, "frozen", False):
+                self._apply_windows_exe_update(downloaded_path)
+            else:
+                self._apply_source_update(downloaded_path)
+        except Exception as e:
+            logger.error(f"Failed to apply update: {e}")
+            messagebox.showerror("Update Failed", f"Couldn't install the update:\n{e}")
+
+    def _apply_windows_exe_update(self, new_exe_path):
+        """Replaces the running .exe with the downloaded one. Windows won't
+        let a running executable overwrite itself directly, so this writes
+        a tiny helper batch script that: waits for the current process to
+        release its file lock, moves the new exe into place, relaunches it,
+        then deletes itself. We hand off to that script and exit — this is
+        the standard self-update pattern used by many Windows desktop apps."""
+        current_exe = Path(sys.executable)
+        new_exe_path = Path(new_exe_path)
+        batch_path = Path(tempfile.gettempdir()) / "pdf_checker_update.bat"
+
+        batch_script = f"""@echo off
+:wait_loop
+del "{current_exe}" >NUL 2>&1
+if exist "{current_exe}" (
+    timeout /t 1 /nobreak >NUL
+    goto wait_loop
+)
+copy /Y "{new_exe_path}" "{current_exe}" >NUL
+del "{new_exe_path}" >NUL 2>&1
+start "" "{current_exe}"
+(goto) 2>nul & del "%~f0"
+"""
+        batch_path.write_text(batch_script, encoding="utf-8")
+        logger.info(f"Launching update helper script: {batch_path}")
+
+        subprocess.Popen(
+            ["cmd", "/c", str(batch_path)],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.root.destroy()
+        sys.exit(0)
+
+    def _apply_source_update(self, new_script_path):
+        """Running from source: overwrite this script's file with the
+        downloaded one and relaunch. No file-lock workaround is needed
+        here — Python reads the script into memory at startup and doesn't
+        keep it open, so the file on disk can be safely replaced while
+        running."""
+        current_script = Path(__file__).resolve()
+        new_script_path = Path(new_script_path)
+
+        backup_path = current_script.with_suffix(current_script.suffix + ".bak")
+        shutil.copy2(current_script, backup_path)
+        shutil.copy2(new_script_path, current_script)
+        logger.info(f"Replaced {current_script} with downloaded update (backup at {backup_path})")
+
+        subprocess.Popen([sys.executable, str(current_script)])
+        self.root.destroy()
+        sys.exit(0)
 
     def setup_ui(self):
         self.setup_styles()
@@ -756,6 +1456,14 @@ class PDFErrorChecker:
                                              width=120, height=38)
         self.settings_button.pack(side=tk.RIGHT)
 
+        self.history_button = RoundedButton(header_frame, text="History", command=self.open_history,
+                                            bg="#34495e", fg="white", font=("Segoe UI", 10),
+                                            width=100, height=38)
+        self.history_button.pack(side=tk.RIGHT, padx=(0, 10))
+
+    def open_history(self):
+        ScanHistoryDialog(self.root, self.scan_history)
+
     def setup_dependency_banner(self):
         """Show a visible warning if PyMuPDF is missing, since two of the
         three scan checks degrade significantly without it."""
@@ -780,6 +1488,7 @@ class PDFErrorChecker:
         left_panel.pack_propagate(False)
 
         self.setup_folder_selection(left_panel)
+        self.setup_scan_mode(left_panel)
         self.setup_scan_options(left_panel)
         self.setup_action_buttons(left_panel)
 
@@ -810,6 +1519,84 @@ class PDFErrorChecker:
                                    width=100, height=35)
         browse_btn.pack(side=tk.RIGHT, padx=(10, 0))
 
+    def setup_scan_mode(self, parent):
+        mode_frame = tk.LabelFrame(parent, text="Scan Mode", font=("Segoe UI", 11, "bold"),
+                                   bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
+        mode_frame.pack(fill=tk.X, pady=(0, 15))
+
+        self.scan_mode_var = tk.StringVar(value=self.settings.get("scan_mode", "project"))
+
+        project_rb = tk.Radiobutton(
+            mode_frame, text="Project Structure (target subfolders)", variable=self.scan_mode_var,
+            value="project", font=("Segoe UI", 10), bg="#ffffff", fg="#34495e",
+            selectcolor="#ffffff", activebackground="#ffffff", command=self._on_scan_mode_change,
+        )
+        project_rb.pack(anchor=tk.W, pady=(0, 4))
+        Tooltip(project_rb, "Only scans subfolders matching the target names configured in "
+                            "Settings → Scan Settings (default: open, confidential).")
+
+        all_rb = tk.Radiobutton(
+            mode_frame, text="All PDFs (Recursive)", variable=self.scan_mode_var,
+            value="all", font=("Segoe UI", 10), bg="#ffffff", fg="#34495e",
+            selectcolor="#ffffff", activebackground="#ffffff", command=self._on_scan_mode_change,
+        )
+        all_rb.pack(anchor=tk.W)
+        Tooltip(all_rb, "Ignores subfolder naming entirely and scans every PDF found under the "
+                        "selected folder and all of its subfolders.")
+
+        self.target_subfolders_hint = tk.Label(
+            mode_frame, text=self._target_subfolders_hint_text(), font=("Segoe UI", 8, "italic"),
+            bg="#ffffff", fg="#95a5a6", wraplength=320, justify=tk.LEFT,
+        )
+        self.target_subfolders_hint.pack(anchor=tk.W, pady=(8, 0))
+
+    def _target_subfolders_hint_text(self):
+        targets = ", ".join(self._get_target_subfolder_names())
+        alias_note = " (+ common variations)" if self.settings.get("use_folder_aliases", True) else ""
+        return f"Project mode targets: {targets}{alias_note}. Edit in Settings → Scan Settings."
+
+    def _on_scan_mode_change(self):
+        self.settings.set("scan_mode", self.scan_mode_var.get())
+
+    def _get_target_subfolder_names(self):
+        raw = self.settings.get("target_subfolders", "open, confidential")
+        names = [n.strip() for n in raw.split(",") if n.strip()]
+        return names or ["open", "confidential"]
+
+    @staticmethod
+    def _expand_folder_aliases(name_lower):
+        for group in FOLDER_NAME_GROUPS:
+            if name_lower in group:
+                return group
+        return {name_lower}
+
+    def _match_subfolders(self, dirs):
+        """Given the subdirectory names found at one level of os.walk,
+        return (target_name, actual_dir_name) pairs for every configured
+        target subfolder that's present — matched case-insensitively, and
+        via known naming aliases when enabled. A folder only needs to
+        contain at least one of these, not all of them."""
+        targets = self._get_target_subfolder_names()
+        use_aliases = self.settings.get("use_folder_aliases", True)
+
+        dirs_lower_map = {}
+        for d in dirs:
+            dirs_lower_map.setdefault(d.lower(), d)
+
+        matches = []
+        seen_actual = set()
+        for target in targets:
+            target_lower = target.lower()
+            candidate_names = self._expand_folder_aliases(target_lower) if use_aliases else {target_lower}
+            for cand in candidate_names:
+                if cand in dirs_lower_map:
+                    actual = dirs_lower_map[cand]
+                    if actual not in seen_actual:
+                        matches.append((target, actual))
+                        seen_actual.add(actual)
+                    break
+        return matches
+
     def setup_scan_options(self, parent):
         options_frame = tk.LabelFrame(parent, text="Scan Options", font=("Segoe UI", 11, "bold"),
                                       bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
@@ -818,15 +1605,23 @@ class PDFErrorChecker:
         self.check_cannot_open = tk.BooleanVar(value=self.settings.get("check_cannot_open", True))
         self.check_not_clear = tk.BooleanVar(value=self.settings.get("check_not_clear", True))
         self.check_missing_info = tk.BooleanVar(value=self.settings.get("check_missing_info", True))
+        self.check_password_protected = tk.BooleanVar(value=self.settings.get("check_password_protected", True))
+        self.check_duplicates = tk.BooleanVar(value=self.settings.get("check_duplicates", True))
 
         checks = [
             ("Cannot Open (Corrupt)", self.check_cannot_open,
              "Flags PDFs that fail to open or report zero pages — likely corrupted files."),
+            ("Password Protected", self.check_password_protected,
+             "Flags PDFs that require a password to open. Reported separately from 'Cannot "
+             "Open' so it's clear which files just need a password versus which are truly broken."),
             ("Not Clear (Low Resolution)", self.check_not_clear,
              f"Flags scanned pages with embedded images below the DPI threshold below."
              f"{'' if FITZ_AVAILABLE else ' (Disabled: requires PyMuPDF.)'}"),
             ("Missing Information", self.check_missing_info,
              "Flags PDFs with little or no extractable text, or mostly blank pages."),
+            ("Duplicate Detection", self.check_duplicates,
+             "Hashes file contents to flag the same PDF appearing in more than one scanned "
+             "location (e.g. both 'open' and 'confidential') — its own kind of compliance issue."),
         ]
 
         self._scan_check_vars = [var for _, var, _ in checks]
@@ -967,8 +1762,11 @@ class PDFErrorChecker:
 
         # Row tags: severity-based background tint (most severe error wins).
         self.results_tree.tag_configure("cannot_open", background="#fdecea")
+        self.results_tree.tag_configure("password_protected", background="#f3e6fb")
+        self.results_tree.tag_configure("duplicate", background="#e6f0fa")
         self.results_tree.tag_configure("not_clear", background="#fff6e5")
         self.results_tree.tag_configure("missing_info", background="#fffbe0")
+        self.results_tree.tag_configure("placeholder", foreground="#95a5a6")
 
         self.results_tree.bind("<Double-1>", self._on_result_double_click)
         self.results_tree.bind("<Button-3>", self._on_result_right_click)   # Windows/Linux right-click
@@ -982,10 +1780,19 @@ class PDFErrorChecker:
         self.results_context_menu.add_separator()
         self.results_context_menu.add_command(label="Copy Path", command=self._copy_selected_result_path)
 
+        # Show the friendly empty-state message immediately — the panel
+        # otherwise starts as just a blank box, which reads as broken on
+        # first run rather than "nothing to show yet".
+        self._refresh_results_tree()
+
     def _tag_for_errors(self, errors):
         """Most severe error determines the row's color tint."""
         if "Cannot Open" in errors:
             return "cannot_open"
+        if "Password Protected" in errors:
+            return "password_protected"
+        if any(e.startswith("Duplicate") for e in errors):
+            return "duplicate"
         if "Not Clear" in errors:
             return "not_clear"
         if "Missing Information" in errors:
@@ -1001,6 +1808,10 @@ class PDFErrorChecker:
         ]).lower()
         return filter_text.lower() in haystack
 
+    def _insert_placeholder_row(self, message):
+        self.results_tree.insert("", tk.END, iid="__placeholder__",
+                                 values=(message, "", "", ""), tags=("placeholder",))
+
     def _refresh_results_tree(self):
         """Full rebuild of the visible tree from self.results, honoring the
         current filter text and sort column. Each row's iid is the row's
@@ -1010,8 +1821,19 @@ class PDFErrorChecker:
             return
         self.results_tree.delete(*self.results_tree.get_children())
 
+        if not self.results:
+            message = ("No errors found — every scanned PDF looks good."
+                       if self.has_scanned else
+                       "No results yet — select a folder and start a scan.")
+            self._insert_placeholder_row(message)
+            return
+
         filter_text = self.filter_var.get().strip() if hasattr(self, "filter_var") else ""
         visible = [(i, r) for i, r in enumerate(self.results) if self._row_matches_filter(r, filter_text)]
+
+        if not visible:
+            self._insert_placeholder_row("No results match your filter.")
+            return
 
         sort_col = self._sort_state.get("column")
         if sort_col:
@@ -1049,6 +1871,8 @@ class PDFErrorChecker:
         refresh (filter change, header click, or scan completion) rather
         than on every single insert, which would be wasteful during a big
         scan."""
+        if self.results_tree.exists("__placeholder__"):
+            self.results_tree.delete("__placeholder__")
         filter_text = self.filter_var.get().strip() if hasattr(self, "filter_var") else ""
         if not self._row_matches_filter(result, filter_text):
             return
@@ -1164,6 +1988,12 @@ class PDFErrorChecker:
         width = self.settings.get("window_width", 1200)
         height = self.settings.get("window_height", 850)
         self.root.geometry(f"{width}x{height}")
+        if hasattr(self, "target_subfolders_hint"):
+            self.target_subfolders_hint.config(text=self._target_subfolders_hint_text())
+        # Reload from disk: picks up a "Clear Cache" click, and ensures any
+        # changed thresholds are reflected the next time the cache is
+        # consulted (a stale in-memory copy could otherwise mask a clear).
+        self.scan_cache = ScanCache()
 
     def browse_folder(self):
         folder_selected = filedialog.askdirectory(initialdir=self.settings.get("last_folder", ""))
@@ -1172,16 +2002,17 @@ class PDFErrorChecker:
             self.settings.set("last_folder", folder_selected)
 
     def clear_results(self):
-        self.results_tree.delete(*self.results_tree.get_children())
         if hasattr(self, "filter_var"):
             self.filter_var.set("")
         self._sort_state = {"column": None, "reverse": False}
+        self.results = []
+        self.has_scanned = False
+        self._refresh_results_tree()
         self.summary_label.config(text="No scan performed yet.")
         self.progress["value"] = 0
         self.status_label.config(text="Ready to scan", fg="#27ae60")
         self.current_file_label.config(text="")
         self.eta_label.config(text="")
-        self.results = []
         if self.export_button:
             self.export_button.config(state=tk.DISABLED)
         if self.scan_button:
@@ -1220,10 +2051,14 @@ class PDFErrorChecker:
             settings = []
             if self.check_cannot_open.get():
                 settings.append("Cannot Open")
+            if self.check_password_protected.get():
+                settings.append("Password Protected")
             if self.check_not_clear.get():
                 settings.append("Not Clear")
             if self.check_missing_info.get():
                 settings.append("Missing Information")
+            if self.check_duplicates.get():
+                settings.append("Duplicate Detection")
             settings_para.add_run(f"{', '.join(settings) if settings else 'None'}")
 
             doc.add_paragraph(f"Resolution Threshold: {self.resolution_var.get()} DPI")
@@ -1231,16 +2066,20 @@ class PDFErrorChecker:
             doc.add_heading("Summary", level=2)
             total_checked = len(self.results)
             cannot_open_count = sum(1 for r in self.results if "Cannot Open" in r["errors"])
+            password_count = sum(1 for r in self.results if "Password Protected" in r["errors"])
             not_clear_count = sum(1 for r in self.results if "Not Clear" in r["errors"])
             missing_info_count = sum(1 for r in self.results if "Missing Information" in r["errors"])
+            duplicate_count = sum(1 for r in self.results if any(e.startswith("Duplicate") for e in r["errors"]))
             unique_parents = set(r.get("parent", "N/A") for r in self.results)
 
             summary_rows = [
                 ["Total PDFs With Errors", str(total_checked)],
                 ["Parent Folders Affected", str(len(unique_parents))],
                 ["Cannot Open", str(cannot_open_count)],
+                ["Password Protected", str(password_count)],
                 ["Not Clear (Low Resolution)", str(not_clear_count)],
                 ["Missing Information", str(missing_info_count)],
+                ["Duplicate PDFs", str(duplicate_count)],
             ]
 
             # Fixed: previously created a 3x2 table for 6 rows of data, which
@@ -1266,10 +2105,67 @@ class PDFErrorChecker:
                 file_info.add_run(f"{', '.join(result['errors'])}")
 
             doc.save(doc_path)
-            messagebox.showinfo("Success", f"Report saved to:\n{doc_path}")
+            logger.info(f"Word report saved: {doc_path}")
+
+            auto_open_pref = self.settings.get("auto_open_word_report", "ask")
+            if auto_open_pref == "ask":
+                if self._prompt_open_report():
+                    self._open_file(doc_path)
+            else:
+                messagebox.showinfo("Success", f"Report saved to:\n{doc_path}")
+                if auto_open_pref == "always":
+                    self._open_file(doc_path)
 
         except Exception as e:
+            logger.error(f"Failed to create Word document: {e}")
             messagebox.showerror("Error", f"Failed to create Word document:\n{str(e)}")
+
+    def _prompt_open_report(self):
+        """Small custom dialog (a plain messagebox can't host a checkbox)
+        offering to open the just-saved report, with a 'don't ask again'
+        option that locks in the choice via Settings → General."""
+        result = {"open": False}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Report Saved")
+        dialog.configure(bg="#f5f6fa")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frame = tk.Frame(dialog, bg="#f5f6fa", padx=25, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(frame, text="Report saved successfully.\nWould you like to open it now?",
+                 font=("Segoe UI", 10), bg="#f5f6fa", fg="#2c3e50", justify=tk.LEFT).pack(anchor=tk.W)
+
+        dont_ask_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(frame, text="Don't ask again", variable=dont_ask_var, font=("Segoe UI", 9),
+                      bg="#f5f6fa", selectcolor="#f5f6fa").pack(anchor=tk.W, pady=(10, 15))
+
+        def choose(should_open):
+            if dont_ask_var.get():
+                self.settings.set("auto_open_word_report", "always" if should_open else "never")
+                self.settings.save(self.settings.settings)
+            result["open"] = should_open
+            dialog.destroy()
+
+        btn_row = tk.Frame(frame, bg="#f5f6fa")
+        btn_row.pack(fill=tk.X)
+        RoundedButton(btn_row, text="Open Report", command=lambda: choose(True),
+                      bg="#3498db", fg="white", font=("Segoe UI", 10, "bold"),
+                      width=130, height=36).pack(side=tk.RIGHT)
+        RoundedButton(btn_row, text="Not Now", command=lambda: choose(False),
+                      bg="#95a5a6", fg="white", font=("Segoe UI", 10, "bold"),
+                      width=100, height=36).pack(side=tk.RIGHT, padx=(0, 10))
+
+        dialog.update_idletasks()
+        w, h = dialog.winfo_reqwidth(), dialog.winfo_reqheight()
+        x = (dialog.winfo_screenwidth() - w) // 2
+        y = (dialog.winfo_screenheight() - h) // 2
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        dialog.wait_window()
+        return result["open"]
 
     def start_scan(self):
         folder_path = self.folder_path.get()
@@ -1281,22 +2177,44 @@ class PDFErrorChecker:
             messagebox.showerror("Error", "Selected folder does not exist!")
             return
 
-        valid_folders = []
-        for root, dirs, files in os.walk(folder_path):
-            if "open" in dirs and "confidential" in dirs:
-                valid_folders.append(root)
+        scan_mode = self.scan_mode_var.get() if hasattr(self, "scan_mode_var") else "project"
+        folder_matches = {}
 
-        if not valid_folders:
-            messagebox.showerror("Error", "No subfolders with both 'open' and 'confidential' found!\n\n"
-                                           "Tip: Each project folder should contain both subfolders.")
-            return
+        if scan_mode == "all":
+            valid_folders = [folder_path]
+            response = messagebox.askyesno(
+                "Confirm Scan",
+                f"This will recursively scan every PDF found under:\n{folder_path}\n\nContinue?"
+            )
+        else:
+            valid_folders = []
+            for root, dirs, files in os.walk(folder_path):
+                matches = self._match_subfolders(dirs)
+                if matches:
+                    valid_folders.append(root)
+                    folder_matches[root] = matches
 
-        response = messagebox.askyesno("Confirm Scan", f"Found {len(valid_folders)} valid project folders.\n\nContinue?")
+            if not valid_folders:
+                targets = ", ".join(self._get_target_subfolder_names())
+                messagebox.showerror(
+                    "Error",
+                    f"No subfolders matching your configured targets ({targets}) were found!\n\n"
+                    "Tip: adjust the target subfolder names under Settings → Scan Settings, "
+                    "or switch to 'All PDFs (Recursive)' mode to scan every PDF under the "
+                    "selected folder regardless of naming."
+                )
+                return
+
+            response = messagebox.askyesno(
+                "Confirm Scan", f"Found {len(valid_folders)} valid project folders.\n\nContinue?"
+            )
+
         if not response:
             return
 
         self.running = True
         self.clear_results()
+        self.has_scanned = True
         self.results = []
 
         if self.scan_button:
@@ -1306,31 +2224,70 @@ class PDFErrorChecker:
         if self.export_button:
             self.export_button.config(state=tk.DISABLED)
 
-        self.scan_thread = threading.Thread(target=self.run_scan, args=(valid_folders,), daemon=True)
+        self.scan_thread = threading.Thread(
+            target=self.run_scan, args=(valid_folders, scan_mode, folder_matches), daemon=True
+        )
         self.scan_thread.start()
 
-    def run_scan(self, valid_folders):
+    def run_scan(self, valid_folders, scan_mode="project", folder_matches=None):
         check_cannot_open = self.check_cannot_open.get()
         check_not_clear = self.check_not_clear.get()
         check_missing_info = self.check_missing_info.get()
+        check_password_protected = self.check_password_protected.get()
+        check_duplicates = self.check_duplicates.get()
         resolution_threshold = self.resolution_var.get()
+        folder_matches = folder_matches or {}
+
+        cache_enabled = self.settings.get("enable_scan_cache", True)
+        max_workers = max(1, int(self.settings.get("max_workers", 4)))
+        per_file_timeout = self.settings.get("per_file_timeout_seconds", 30)
+
+        # Everything that can change a check's outcome. If any of these
+        # differ from what was in effect when a file was last cached, that
+        # cache entry is treated as a miss and the file is re-checked —
+        # otherwise a stale hit could silently report an outdated result.
+        check_signature = [
+            check_cannot_open, check_not_clear, check_missing_info, check_password_protected,
+            resolution_threshold, self.settings.get("max_pages_check_resolution", 5),
+            self.settings.get("min_text_length", 50), self.settings.get("empty_page_threshold", 0.8),
+        ]
 
         all_pdfs = []
-        for folder in valid_folders:
-            parent_name = os.path.basename(folder)
-            for subfolder in ["open", "confidential"]:
-                subfolder_path = os.path.join(folder, subfolder)
-                if not os.path.exists(subfolder_path):
-                    continue
-                for root, _, files in os.walk(subfolder_path):
-                    for file in files:
-                        if file.lower().endswith(".pdf"):
-                            all_pdfs.append({
-                                "path": os.path.join(root, file),
-                                "folder": subfolder,
-                                "parent": parent_name,
-                                "filename": file,
-                            })
+        if scan_mode == "all":
+            # All PDFs (Recursive): no subfolder naming requirement at all —
+            # every PDF under the selected folder counts, and the "Subfolder"
+            # column shows the file's path relative to that root instead of
+            # a fixed "open"/"confidential" label.
+            base_folder = valid_folders[0]
+            base_name = os.path.basename(os.path.normpath(base_folder)) or base_folder
+            for root, _, files in os.walk(base_folder):
+                rel_dir = os.path.relpath(root, base_folder)
+                subfolder_label = "(root)" if rel_dir == "." else rel_dir.replace("\\", "/")
+                for file in files:
+                    if file.lower().endswith(".pdf"):
+                        all_pdfs.append({
+                            "path": os.path.join(root, file),
+                            "folder": subfolder_label,
+                            "parent": base_name,
+                            "filename": file,
+                        })
+        else:
+            for folder in valid_folders:
+                parent_name = os.path.basename(folder)
+                matched_subfolders = [actual for _, actual in folder_matches.get(folder, [])]
+                for subfolder in matched_subfolders:
+                    subfolder_path = os.path.join(folder, subfolder)
+                    if not os.path.exists(subfolder_path):
+                        continue
+                    for root, _, files in os.walk(subfolder_path):
+                        for file in files:
+                            if file.lower().endswith(".pdf"):
+                                all_pdfs.append({
+                                    "path": os.path.join(root, file),
+                                    "folder": subfolder,
+                                    "parent": parent_name,
+                                    "filename": file,
+                                })
 
         if not all_pdfs:
             self.root.after(0, lambda: messagebox.showinfo("Info", "No PDF files found!"))
@@ -1340,50 +2297,194 @@ class PDFErrorChecker:
 
         total_pdfs = len(all_pdfs)
         self.scan_start_time = datetime.now()
+        logger.info(f"Scan started: mode={scan_mode}, files={total_pdfs}, workers={max_workers}")
 
         # Fixed: progress bar defaults to maximum=100, so folders with more
         # than 100 PDFs would hit 100% long before the scan actually finished.
         self.root.after(0, lambda: self.progress.config(maximum=total_pdfs, value=0))
 
-        for i, pdf_info in enumerate(all_pdfs):
+        cache_hits = 0
+        timeouts = 0
+
+        # File checks are I/O-bound (mostly disk reads + PDF parsing), so a
+        # small worker pool gives a real speedup even on a single core.
+        # Futures are consumed in the SAME order they were submitted (not
+        # via as_completed) specifically so that calling future.result()
+        # with a per-file timeout enforces a genuine per-file cap: by the
+        # time we ask for a given future's result, it's already been
+        # running in the background since submission, so the timeout here
+        # is a true ceiling on how long we'll wait for that one file rather
+        # than an arbitrary slice of an unrelated overall budget.
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pdfcheck")
+        futures = []
+        try:
+            for pdf_info in all_pdfs:
+                if not self.running:
+                    break
+                future = executor.submit(
+                    self._check_pdf_cached, pdf_info["path"], check_cannot_open, check_not_clear,
+                    check_missing_info, check_password_protected, resolution_threshold,
+                    cache_enabled, check_signature, check_duplicates,
+                )
+                futures.append((future, pdf_info))
+
+            for i, (future, pdf_info) in enumerate(futures):
+                if not self.running:
+                    break
+
+                pdf_path = pdf_info["path"]
+                folder_name = pdf_info["folder"]
+                parent_name = pdf_info["parent"]
+                filename = pdf_info["filename"]
+
+                elapsed_seconds = (datetime.now() - self.scan_start_time).total_seconds()
+                avg_per_file = elapsed_seconds / max(i, 1) if i > 0 else 0
+                remaining_files = total_pdfs - i
+                eta_seconds = avg_per_file * remaining_files
+                elapsed_str = self._format_duration(elapsed_seconds)
+                eta_str = self._format_duration(eta_seconds) if i > 0 else "calculating..."
+
+                self.root.after(0, lambda idx=i+1, total=total_pdfs, name=filename, parent=parent_name,
+                                elapsed=elapsed_str, eta=eta_str: (
+                    self.status_label.config(text=f"Scanning... ({idx}/{total})"),
+                    self.current_file_label.config(text=f"{parent}/{name[:30]}..."),
+                    self.progress.config(value=idx),
+                    self.eta_label.config(text=f"Elapsed: {elapsed}  |  ETA: {eta}")
+                ))
+
+                try:
+                    errors, file_hash, used_cache = future.result(timeout=per_file_timeout)
+                except FuturesTimeoutError:
+                    errors, file_hash, used_cache = ["Scan Timeout"], None, False
+                    timeouts += 1
+                    logger.warning(f"Per-file timeout ({per_file_timeout}s) exceeded: {pdf_path}")
+                except Exception as e:
+                    errors, file_hash, used_cache = [], None, False
+                    logger.error(f"Error checking {pdf_path}: {e}")
+
+                pdf_info["_hash"] = file_hash
+                if used_cache:
+                    cache_hits += 1
+
+                if errors and self.running:
+                    self.results.append({
+                        "path": pdf_path,
+                        "folder": folder_name,
+                        "parent": parent_name,
+                        "filename": filename,
+                        "errors": errors,
+                    })
+                    result_index = len(self.results) - 1
+                    result_copy = self.results[result_index]
+                    self.root.after(0, lambda r=result_copy, idx=result_index: self._append_result_row(r, idx))
+        finally:
+            # Don't block on any still-running (e.g. timed-out or hung)
+            # worker threads — Python threads can't be force-killed, so we
+            # simply stop waiting on them. Anything not yet started is
+            # cancelled outright. (A file that's genuinely hung will keep
+            # its one worker thread alive in the background; this is a
+            # documented, accepted trade-off for a pure-Python thread pool.)
+            for future, _ in futures:
+                future.cancel()
+            executor.shutdown(wait=False)
+
+        if check_duplicates and self.running:
+            self.root.after(0, lambda: self.status_label.config(text="Checking for duplicates..."))
+            self._detect_duplicates(all_pdfs)
+
+        try:
+            self.scan_cache.prune_missing({p["path"] for p in all_pdfs})
+            self.scan_cache.save()
+        except Exception as e:
+            logger.warning(f"Failed to persist scan cache: {e}")
+
+        self.root.after(0, lambda: self.finish_scan(all_pdfs, cache_hits, timeouts))
+
+    def _hash_file(self, path, chunk_size=1024 * 1024):
+        try:
+            hasher = hashlib.sha256()
+            with open(path, "rb") as f:
+                while True:
+                    if not self.running:
+                        return None
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except Exception as e:
+            logger.warning(f"Could not hash file {path}: {e}")
+            return None
+
+    def _check_pdf_cached(self, pdf_path, check_cannot_open, check_not_clear, check_missing_info,
+                          check_password_protected, resolution_threshold, cache_enabled,
+                          signature, need_hash=False):
+        """Runs on a worker thread. Consults the scan cache first (size +
+        mtime + settings signature); on a miss, runs the real checks and
+        records the result for next time."""
+        size, mtime = None, None
+        try:
+            stat = os.stat(pdf_path)
+            size, mtime = stat.st_size, stat.st_mtime
+        except OSError as e:
+            logger.warning(f"Could not stat {pdf_path}: {e}")
+
+        if cache_enabled and size is not None:
+            cached = self.scan_cache.get(pdf_path, size, mtime, signature)
+            if cached is not None:
+                file_hash = cached.get("hash")
+                if need_hash and file_hash is None:
+                    file_hash = self._hash_file(pdf_path)
+                return cached.get("errors", []), file_hash, True
+
+        errors = self.check_pdf(pdf_path, check_cannot_open, check_not_clear,
+                                check_missing_info, check_password_protected, resolution_threshold)
+        file_hash = self._hash_file(pdf_path) if need_hash else None
+
+        if cache_enabled and size is not None and self.running:
+            self.scan_cache.set(pdf_path, size, mtime, signature, errors, file_hash)
+
+        return errors, file_hash, False
+
+    def _detect_duplicates(self, all_pdfs):
+        """Groups files by content hash (computed during the main pass, or
+        here if that step was skipped/cached without one) and flags any
+        file whose exact content also appears elsewhere in this scan —
+        e.g. the same PDF present in both 'open' and 'confidential'."""
+        hash_map = {}
+        for pdf_info in all_pdfs:
             if not self.running:
-                break
+                return
+            file_hash = pdf_info.get("_hash")
+            if file_hash is None:
+                file_hash = self._hash_file(pdf_info["path"])
+            if file_hash is None:
+                continue
+            hash_map.setdefault(file_hash, []).append(pdf_info)
 
-            pdf_path = pdf_info["path"]
-            folder_name = pdf_info["folder"]
-            parent_name = pdf_info["parent"]
-            filename = pdf_info["filename"]
+        for group in hash_map.values():
+            if len(group) < 2:
+                continue
+            for pdf_info in group:
+                others = [p for p in group if p is not pdf_info]
+                other_desc = ", ".join(f"{p['parent']}/{p['folder']}/{p['filename']}" for p in others[:3])
+                if len(others) > 3:
+                    other_desc += f", +{len(others) - 3} more"
+                self._record_duplicate(pdf_info, f"Duplicate (also in {other_desc})")
 
-            elapsed_seconds = (datetime.now() - self.scan_start_time).total_seconds()
-            avg_per_file = elapsed_seconds / max(i, 1) if i > 0 else 0
-            remaining_files = total_pdfs - i
-            eta_seconds = avg_per_file * remaining_files
-            elapsed_str = self._format_duration(elapsed_seconds)
-            eta_str = self._format_duration(eta_seconds) if i > 0 else "calculating..."
-
-            self.root.after(0, lambda idx=i+1, total=total_pdfs, name=filename, parent=parent_name,
-                            elapsed=elapsed_str, eta=eta_str: (
-                self.status_label.config(text=f"Scanning... ({idx}/{total})"),
-                self.current_file_label.config(text=f"{parent}/{name[:30]}..."),
-                self.progress.config(value=idx),
-                self.eta_label.config(text=f"Elapsed: {elapsed}  |  ETA: {eta}")
-            ))
-
-            errors = self.check_pdf(pdf_path, check_cannot_open, check_not_clear, check_missing_info, resolution_threshold)
-
-            if errors and self.running:
-                self.results.append({
-                    "path": pdf_path,
-                    "folder": folder_name,
-                    "parent": parent_name,
-                    "filename": filename,
-                    "errors": errors,
-                })
-                result_index = len(self.results) - 1
-                result_copy = self.results[result_index]
-                self.root.after(0, lambda r=result_copy, idx=result_index: self._append_result_row(r, idx))
-
-        self.root.after(0, lambda: self.finish_scan(all_pdfs))
+    def _record_duplicate(self, pdf_info, error_label):
+        existing = next((r for r in self.results if r["path"] == pdf_info["path"]), None)
+        if existing:
+            if error_label not in existing["errors"]:
+                existing["errors"].append(error_label)
+            return
+        self.results.append({
+            "path": pdf_info["path"],
+            "folder": pdf_info["folder"],
+            "parent": pdf_info["parent"],
+            "filename": pdf_info["filename"],
+            "errors": [error_label],
+        })
 
     @staticmethod
     def _format_duration(total_seconds):
@@ -1394,7 +2495,7 @@ class PDFErrorChecker:
             return f"{hours}:{minutes:02d}:{seconds:02d}"
         return f"{minutes}:{seconds:02d}"
 
-    def finish_scan(self, all_pdfs):
+    def finish_scan(self, all_pdfs, cache_hits=0, timeouts=0):
         total_checked = len(all_pdfs)
         total_errors = len(self.results)
         scan_duration = datetime.now() - self.scan_start_time
@@ -1405,6 +2506,10 @@ class PDFErrorChecker:
 
         summary_text = (f"Scan {status_word}: {total_checked} PDFs in {unique_parents} folders | "
                         f"Errors: {total_errors} | Time: {scan_duration_seconds:.1f}s")
+        if cache_hits:
+            summary_text += f" | Skipped {cache_hits} unchanged"
+        if timeouts:
+            summary_text += f" | {timeouts} timed out"
 
         self.summary_label.config(text=summary_text, fg="#27ae60" if self.running else "#e67e22")
         self.status_label.config(text=f"Scan {status_word}", fg="#27ae60" if self.running else "#e67e22")
@@ -1412,6 +2517,18 @@ class PDFErrorChecker:
         self.eta_label.config(text=f"Total time: {self._format_duration(scan_duration_seconds)}")
         was_cancelled = not self.running
         self.running = False
+        logger.info(f"Scan {status_word}: {total_checked} files, {total_errors} errors, "
+                   f"{cache_hits} cache hits, {timeouts} timeouts, {scan_duration_seconds:.1f}s")
+
+        self.scan_history.add({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "folder": self.folder_path.get(),
+            "scan_mode": self.scan_mode_var.get() if hasattr(self, "scan_mode_var") else "project",
+            "files_checked": total_checked,
+            "errors_found": total_errors,
+            "duration_seconds": round(scan_duration_seconds, 1),
+            "cancelled": was_cancelled,
+        })
 
         # Reapply the current sort (if any) now that the full result set is
         # in — during the scan itself, rows were appended in discovery order
@@ -1445,7 +2562,8 @@ class PDFErrorChecker:
         if self.cancel_button:
             self.cancel_button.config(state=tk.DISABLED)
 
-    def check_pdf(self, pdf_path, check_cannot_open, check_not_clear, check_missing_info, resolution_threshold):
+    def check_pdf(self, pdf_path, check_cannot_open, check_not_clear, check_missing_info,
+                  check_password_protected, resolution_threshold):
         # Finer-grained cancel: previously Cancel only took effect between
         # files, so one huge multi-page PDF could stall it noticeably.
         # Checking self.running between (and inside) each sub-check lets a
@@ -1453,6 +2571,24 @@ class PDFErrorChecker:
         errors = []
         if not self.running:
             return errors
+
+        is_protected = False
+        if check_password_protected:
+            is_protected = self.is_pdf_password_protected(pdf_path)
+            if is_protected:
+                errors.append("Password Protected")
+
+        if not self.running:
+            return errors
+
+        # A password-protected file can't be meaningfully read further
+        # without the password, so once it's flagged that way we don't also
+        # pile on "Cannot Open" (or the other content checks) for what's
+        # really the same underlying reason — that's a separate, more
+        # actionable finding on its own.
+        if is_protected:
+            return errors
+
         if check_cannot_open and self.is_pdf_corrupt(pdf_path):
             errors.append("Cannot Open")
             return errors
@@ -1465,6 +2601,26 @@ class PDFErrorChecker:
         if check_missing_info and self.has_missing_information(pdf_path):
             errors.append("Missing Information")
         return errors
+
+    def is_pdf_password_protected(self, pdf_path):
+        """Detects encryption without needing the actual password — both
+        PyMuPDF and PyPDF2 expose this without decrypting the content."""
+        if FITZ_AVAILABLE:
+            try:
+                doc = fitz.open(pdf_path)
+                protected = doc.needs_pass
+                doc.close()
+                return protected
+            except Exception:
+                pass
+        if PYPDF2_AVAILABLE:
+            try:
+                with open(pdf_path, "rb") as f:
+                    reader = PdfReader(f)
+                    return bool(reader.is_encrypted)
+            except Exception:
+                pass
+        return False
 
     def is_pdf_corrupt(self, pdf_path):
         if FITZ_AVAILABLE:
