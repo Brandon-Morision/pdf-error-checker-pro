@@ -15,6 +15,9 @@ A professional desktop application for scanning and validating PDF files across 
 - 🕳️ **Empty-state polish** — the results panel now shows a friendly message before any scan, after a clean scan, or when a filter excludes everything, instead of an unexplained blank box.
 - 🪵 **File-based logging** — failures are now logged to `pdf_checker.log` (with rotation) instead of only printing to a console window nobody's watching, so issues are diagnosable after the fact.
 - 🚀 **In-app auto-updater** — download and install updates directly from GitHub releases with live progress tracking and automatic restart (via a self-deleting helper script for `.exe` on Windows or script replacement with `.bak` backup when running from source).
+- 📱 **Scrollable sidebar & small-screen support** — the left sidebar is now scrollable via mousewheel or vertical scrollbar, and window startup dimensions auto-clamp to fit smaller displays (such as 1366x768 or 1536x864 at 125% scaling) so action buttons are never pushed off-screen.
+- 🎯 **Accurate content detection for "Missing Information"** — pages containing embedded raster images, vector graphics/drawings, or interactive form widgets are no longer falsely treated as empty, preventing legitimate scanned documents, certificates, and diagrams from triggering false positives.
+- 🔬 **Smart DPI calculation for "Not Clear"** — resolution is now computed against each image's actual rendered bounding box on the page rather than entire page dimensions. Thin decorative rules, gradient lines, and separator strips (< 0.5" or aspect ratio > 15:1) are filtered out, standard nominal screen-resolution graphics (72 DPI) are protected with a tolerance margin, and pages with rich native digital text distinguish standard on-screen graphics (≥ 70 DPI) from low-resolution scans (which strictly enforce the configured DPI threshold).
 
 ## Previous update
 

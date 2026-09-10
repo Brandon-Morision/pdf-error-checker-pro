@@ -61,7 +61,7 @@ except ImportError:
 
 # GitHub repo for updates
 GITHUB_REPO = "Brandon-Morision/pdf-error-checker-pro"  # Format: username/repo
-CURRENT_VERSION = "0.1.7"
+CURRENT_VERSION = "0.1.8"
 
 # Known naming variations for the two target subfolders. Matching is always
 # case-insensitive; when "use_folder_aliases" is enabled in Settings, typing
@@ -1118,8 +1118,13 @@ class PDFErrorChecker:
         self.settings = Settings()
         width = self.settings.get("window_width", 1200)
         height = self.settings.get("window_height", 850)
-        self.root.geometry(f"{width}x{height}")
-        self.root.minsize(1000, 650)
+        # Ensure initial window dimensions do not exceed the physical screen
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        target_w = min(width, max(850, screen_w - 60))
+        target_h = min(height, max(500, screen_h - 90))
+        self.root.geometry(f"{target_w}x{target_h}")
+        self.root.minsize(800, 500)
         self.root.configure(bg="#f5f6fa")
         self.root.resizable(True, True)
 
@@ -1480,17 +1485,56 @@ start "" "{current_exe}"
         ).pack(anchor=tk.W)
 
     def setup_main_content(self):
-        main_frame = tk.Frame(self.root, bg="#f5f6fa", padx=20, pady=20)
+        main_frame = tk.Frame(self.root, bg="#f5f6fa", padx=15, pady=15)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        left_panel = tk.Frame(main_frame, bg="#f5f6fa", width=380)
-        left_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 20))
-        left_panel.pack_propagate(False)
+        # Left panel: wrapped in a scrollable canvas with a vertical scrollbar
+        # so all options and action buttons remain fully visible and reachable
+        # on smaller screens or displays with high DPI scaling.
+        left_container = tk.Frame(main_frame, bg="#f5f6fa", width=380)
+        left_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
+        left_container.pack_propagate(False)
+
+        left_canvas = tk.Canvas(left_container, bg="#f5f6fa", highlightthickness=0, width=355)
+        left_scrollbar = ttk.Scrollbar(left_container, orient=tk.VERTICAL, command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        left_panel = tk.Frame(left_canvas, bg="#f5f6fa")
+        left_window_id = left_canvas.create_window((0, 0), window=left_panel, anchor=tk.NW, width=355)
+
+        def _update_left_scrollregion(_event=None):
+            left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+
+        def _resize_left_inner(event):
+            left_canvas.itemconfig(left_window_id, width=event.width)
+            _update_left_scrollregion()
+
+        left_panel.bind("<Configure>", _update_left_scrollregion)
+        left_canvas.bind("<Configure>", _resize_left_inner)
+
+        def _on_left_mousewheel(event):
+            # Allow scrolling when content exceeds visible canvas height
+            if left_canvas.winfo_height() < left_panel.winfo_reqheight():
+                left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        def _bind_mousewheel_tree(widget):
+            widget.bind("<MouseWheel>", _on_left_mousewheel, add="+")
+            for child in widget.winfo_children():
+                _bind_mousewheel_tree(child)
 
         self.setup_folder_selection(left_panel)
         self.setup_scan_mode(left_panel)
         self.setup_scan_options(left_panel)
         self.setup_action_buttons(left_panel)
+
+        _bind_mousewheel_tree(left_panel)
+        left_canvas.bind("<MouseWheel>", _on_left_mousewheel)
+        left_container.bind("<MouseWheel>", _on_left_mousewheel)
+        left_container.bind("<Enter>", lambda _e: self.root.bind_all("<MouseWheel>", _on_left_mousewheel))
+        left_container.bind("<Leave>", lambda _e: self.root.unbind_all("<MouseWheel>"))
 
         right_panel = tk.Frame(main_frame, bg="#f5f6fa")
         right_panel.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
@@ -1501,11 +1545,11 @@ start "" "{current_exe}"
 
     def setup_folder_selection(self, parent):
         folder_frame = tk.LabelFrame(parent, text="Folder Selection", font=("Segoe UI", 11, "bold"),
-                                     bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
-        folder_frame.pack(fill=tk.X, pady=(0, 15))
+                                     bg="#ffffff", fg="#2c3e50", padx=12, pady=10, relief=tk.FLAT)
+        folder_frame.pack(fill=tk.X, pady=(0, 10))
 
         tk.Label(folder_frame, text="Parent folder (will scan all subfolders with 'open' & 'confidential'):",
-                font=("Segoe UI", 9), bg="#ffffff", fg="#7f8c8d", wraplength=320).pack(anchor=tk.W, pady=(0, 10))
+                font=("Segoe UI", 9), bg="#ffffff", fg="#7f8c8d", wraplength=320).pack(anchor=tk.W, pady=(0, 6))
 
         folder_entry_frame = tk.Frame(folder_frame, bg="#ffffff")
         folder_entry_frame.pack(fill=tk.X)
@@ -1521,8 +1565,8 @@ start "" "{current_exe}"
 
     def setup_scan_mode(self, parent):
         mode_frame = tk.LabelFrame(parent, text="Scan Mode", font=("Segoe UI", 11, "bold"),
-                                   bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
-        mode_frame.pack(fill=tk.X, pady=(0, 15))
+                                   bg="#ffffff", fg="#2c3e50", padx=12, pady=10, relief=tk.FLAT)
+        mode_frame.pack(fill=tk.X, pady=(0, 10))
 
         self.scan_mode_var = tk.StringVar(value=self.settings.get("scan_mode", "project"))
 
@@ -1531,7 +1575,7 @@ start "" "{current_exe}"
             value="project", font=("Segoe UI", 10), bg="#ffffff", fg="#34495e",
             selectcolor="#ffffff", activebackground="#ffffff", command=self._on_scan_mode_change,
         )
-        project_rb.pack(anchor=tk.W, pady=(0, 4))
+        project_rb.pack(anchor=tk.W, pady=(0, 2))
         Tooltip(project_rb, "Only scans subfolders matching the target names configured in "
                             "Settings → Scan Settings (default: open, confidential).")
 
@@ -1548,7 +1592,7 @@ start "" "{current_exe}"
             mode_frame, text=self._target_subfolders_hint_text(), font=("Segoe UI", 8, "italic"),
             bg="#ffffff", fg="#95a5a6", wraplength=320, justify=tk.LEFT,
         )
-        self.target_subfolders_hint.pack(anchor=tk.W, pady=(8, 0))
+        self.target_subfolders_hint.pack(anchor=tk.W, pady=(4, 0))
 
     def _target_subfolders_hint_text(self):
         targets = ", ".join(self._get_target_subfolder_names())
@@ -1599,8 +1643,8 @@ start "" "{current_exe}"
 
     def setup_scan_options(self, parent):
         options_frame = tk.LabelFrame(parent, text="Scan Options", font=("Segoe UI", 11, "bold"),
-                                      bg="#ffffff", fg="#2c3e50", padx=15, pady=15, relief=tk.FLAT)
-        options_frame.pack(fill=tk.X, pady=(0, 15))
+                                      bg="#ffffff", fg="#2c3e50", padx=12, pady=10, relief=tk.FLAT)
+        options_frame.pack(fill=tk.X, pady=(0, 10))
 
         self.check_cannot_open = tk.BooleanVar(value=self.settings.get("check_cannot_open", True))
         self.check_not_clear = tk.BooleanVar(value=self.settings.get("check_not_clear", True))
@@ -1618,7 +1662,7 @@ start "" "{current_exe}"
              f"Flags scanned pages with embedded images below the DPI threshold below."
              f"{'' if FITZ_AVAILABLE else ' (Disabled: requires PyMuPDF.)'}"),
             ("Missing Information", self.check_missing_info,
-             "Flags PDFs with little or no extractable text, or mostly blank pages."),
+             "Flags PDFs with mostly blank pages or lacking content."),
             ("Duplicate Detection", self.check_duplicates,
              "Hashes file contents to flag the same PDF appearing in more than one scanned "
              "location (e.g. both 'open' and 'confidential') — its own kind of compliance issue."),
@@ -1629,7 +1673,7 @@ start "" "{current_exe}"
             cb = tk.Checkbutton(options_frame, text=text, variable=var, font=("Segoe UI", 10),
                           bg="#ffffff", fg="#34495e", selectcolor="#ffffff",
                           activebackground="#ffffff", activeforeground="#34495e")
-            cb.pack(anchor=tk.W, pady=5)
+            cb.pack(anchor=tk.W, pady=2)
             Tooltip(cb, tip_text)
 
         toggle_frame = tk.Frame(options_frame, bg="#ffffff")
@@ -1643,7 +1687,7 @@ start "" "{current_exe}"
                   cursor="hand2", padx=0).pack(side=tk.LEFT)
 
         res_frame = tk.Frame(options_frame, bg="#ffffff")
-        res_frame.pack(fill=tk.X, pady=(10, 0))
+        res_frame.pack(fill=tk.X, pady=(6, 0))
 
         tk.Label(res_frame, text="Resolution Threshold:", font=("Segoe UI", 10), bg="#ffffff",
                  fg="#34495e").pack(side=tk.LEFT)
@@ -1665,30 +1709,30 @@ start "" "{current_exe}"
 
     def setup_action_buttons(self, parent):
         buttons_frame = tk.Frame(parent, bg="#f5f6fa")
-        buttons_frame.pack(fill=tk.X, pady=(15, 0))
+        buttons_frame.pack(fill=tk.X, pady=(10, 15))
 
         self.scan_button = RoundedButton(buttons_frame, text="Start Scan", command=self.start_scan,
                                          bg="#27ae60", fg="white", font=("Segoe UI", 11, "bold"),
-                                         width=340, height=45)
-        self.scan_button.pack(fill=tk.X, pady=(0, 10))
+                                         width=335, height=42)
+        self.scan_button.pack(fill=tk.X, pady=(0, 8))
         Tooltip(self.scan_button, "Scan every project subfolder under the selected parent folder. (Enter)")
 
         self.cancel_button = RoundedButton(buttons_frame, text="Cancel Scan", command=self.cancel_scan,
                                            bg="#e74c3c", fg="white", font=("Segoe UI", 10, "bold"),
-                                           width=340, height=40, state=tk.DISABLED)
-        self.cancel_button.pack(fill=tk.X, pady=(0, 10))
+                                           width=335, height=38, state=tk.DISABLED)
+        self.cancel_button.pack(fill=tk.X, pady=(0, 8))
         Tooltip(self.cancel_button, "Stop the scan as soon as possible, mid-file if needed. (Esc)")
 
         self.export_button = RoundedButton(buttons_frame, text="Export to Word", command=self.export_to_word,
                                            bg="#2980b9", fg="white", font=("Segoe UI", 10, "bold"),
-                                           width=340, height=40, state=tk.DISABLED)
+                                           width=335, height=38, state=tk.DISABLED)
         self.export_button.pack(fill=tk.X)
         Tooltip(self.export_button, "Save the current results as a .docx report. (Ctrl+E)")
 
         clear_btn = RoundedButton(buttons_frame, text="Clear Results", command=self.clear_results,
                                   bg="#95a5a6", fg="white", font=("Segoe UI", 10),
-                                  width=340, height=38)
-        clear_btn.pack(fill=tk.X, pady=(10, 0))
+                                  width=335, height=36)
+        clear_btn.pack(fill=tk.X, pady=(8, 0))
         Tooltip(clear_btn, "Clear the results list and reset progress (does not affect saved reports).")
 
     def setup_progress_section(self, parent):
@@ -2246,7 +2290,9 @@ start "" "{current_exe}"
         # differ from what was in effect when a file was last cached, that
         # cache entry is treated as a miss and the file is re-checked —
         # otherwise a stale hit could silently report an outdated result.
+        SCAN_ENGINE_VERSION = 3  # Bumped to invalidate stale 'Not Clear' false-positive cache entries
         check_signature = [
+            SCAN_ENGINE_VERSION,
             check_cannot_open, check_not_clear, check_missing_info, check_password_protected,
             resolution_threshold, self.settings.get("max_pages_check_resolution", 5),
             self.settings.get("min_text_length", 50), self.settings.get("empty_page_threshold", 0.8),
@@ -2649,6 +2695,7 @@ start "" "{current_exe}"
         try:
             doc = fitz.open(pdf_path)
             max_pages = min(self.settings.get("max_pages_check_resolution", 5), len(doc))
+            min_text = self.settings.get("min_text_length", 50)
             for page_num in range(max_pages):
                 if not self.running:
                     # Cancelled mid-file: bail out of this page loop instead
@@ -2656,6 +2703,11 @@ start "" "{current_exe}"
                     doc.close()
                     return False
                 page = doc[page_num]
+                page_text = page.get_text() or ""
+                clean_text = page_text.strip()
+                has_rich_text = len(clean_text) >= min_text
+                page_rect = page.rect
+
                 image_list = page.get_images(full=True)
                 if image_list:
                     for img in image_list:
@@ -2665,22 +2717,69 @@ start "" "{current_exe}"
                         xref = img[0]
                         try:
                             base_image = doc.extract_image(xref)
-                            if base_image:
-                                width = base_image.get("width", 0)
-                                height = base_image.get("height", 0)
-                                page_rect = page.rect
-                                page_width_inch = page_rect.width / 72
-                                page_height_inch = page_rect.height / 72
-                                if page_width_inch > 0 and page_height_inch > 0:
-                                    dpi = min(width/page_width_inch, height/page_height_inch)
-                                    if dpi < resolution_threshold:
+                            if not base_image:
+                                continue
+                            width = base_image.get("width", 0)
+                            height = base_image.get("height", 0)
+                            if width <= 0 or height <= 0:
+                                continue
+
+                            # 1. Skip thin rules, dividers, gradient strips, or 1D lines (< 10 px in either dimension)
+                            if width < 10 or height < 10:
+                                continue
+
+                            # Determine how the image is actually rendered on the page.
+                            # get_image_rects gives the bounding box(es) where this image is placed.
+                            rects = page.get_image_rects(xref)
+                            if rects:
+                                for rect in rects:
+                                    # 2. Skip tiny decorative icons, bullets, or thin rules (< 0.5 inches in either dimension)
+                                    if rect.width < 36 or rect.height < 36:
+                                        continue
+                                    if rect.width <= 0 or rect.height <= 0:
+                                        continue
+                                    # Skip decorative banners/strips with extreme aspect ratios (> 15:1)
+                                    aspect = max(rect.width, rect.height) / max(min(rect.width, rect.height), 0.1)
+                                    if aspect > 15:
+                                        continue
+
+                                    disp_w_inch = rect.width / 72.0
+                                    disp_h_inch = rect.height / 72.0
+                                    dpi_x = width / disp_w_inch
+                                    dpi_y = height / disp_h_inch
+                                    dpi = min(dpi_x, dpi_y)
+
+                                    # 3. Determine effective threshold:
+                                    # If the page has rich vector text, the document content is native digital text.
+                                    # Standard screen graphics (>= 70 DPI) are clear on screen; only truly pixelated
+                                    # images (< 70 DPI) are flagged. For scanned pages (lacking digital text), the
+                                    # full resolution_threshold is enforced (with 5% nominal tolerance).
+                                    if has_rich_text:
+                                        effective_thresh = min(resolution_threshold, 70)
+                                    else:
+                                        effective_thresh = resolution_threshold * 0.95
+
+                                    if dpi < effective_thresh:
                                         doc.close()
                                         return True
+                            else:
+                                # If no bounding box is exposed (e.g. nested in form XObjects),
+                                # only evaluate if the pixel dimensions indicate a substantial scan or photo.
+                                if width >= 400 or height >= 400:
+                                    page_w_inch = page_rect.width / 72.0
+                                    page_h_inch = page_rect.height / 72.0
+                                    if page_w_inch > 0 and page_h_inch > 0:
+                                        dpi = min(width / page_w_inch, height / page_h_inch)
+                                        eff = min(resolution_threshold, 70) if has_rich_text else resolution_threshold * 0.95
+                                        if dpi < eff:
+                                            doc.close()
+                                            return True
                         except Exception:
                             continue
             doc.close()
             return False
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Could not check image resolution for {pdf_path}: {e}")
             return False
 
     def has_missing_information(self, pdf_path):
@@ -2691,6 +2790,9 @@ start "" "{current_exe}"
             text_content = ""
             page_count = 0
             empty_pages = 0
+            total_images = 0
+            total_drawings = 0
+            total_widgets = 0
             try:
                 doc = fitz.open(pdf_path)
                 page_count = len(doc)
@@ -2699,87 +2801,101 @@ start "" "{current_exe}"
                     return True
                 for page in doc:
                     if not self.running:
-                        # Cancelled mid-file — stop scanning pages; the scan
-                        # loop will discard this result anyway.
                         doc.close()
                         return False
-                    text = page.get_text()
-                    if text:
-                        text_content += text
-                    else:
+
+                    page_text = page.get_text() or ""
+                    clean_text = page_text.strip()
+                    if clean_text:
+                        text_content += page_text
+
+                    page_images = page.get_images()
+                    num_images = len(page_images) if page_images else 0
+                    total_images += num_images
+
+                    page_drawings = page.get_drawings()
+                    num_drawings = len(page_drawings) if page_drawings else 0
+                    total_drawings += num_drawings
+
+                    num_widgets = 0
+                    try:
+                        widgets = page.widgets()
+                        num_widgets = len(list(widgets)) if widgets else 0
+                    except Exception:
+                        num_widgets = 0
+                    total_widgets += num_widgets
+
+                    has_content = bool(clean_text) or (num_images > 0) or (num_drawings > 0) or (num_widgets > 0)
+                    if not has_content:
                         empty_pages += 1
                 doc.close()
-            except Exception:
-                return True
+            except Exception as e:
+                logger.warning(f"Could not inspect content of {pdf_path}: {e}")
+                return False
         else:
-            # Fixed: previously there was no fallback at all when PyMuPDF was
-            # missing, so page_count stayed 0 and every PDF was flagged as
-            # "Missing Information" regardless of its actual content — and
-            # even after adding a fallback, the empty-page-ratio half of this
-            # check was still being skipped. It now runs here too, using
-            # real per-page results from the fallback extractor.
-            text_content, page_count, empty_pages = self._extract_text_fallback(pdf_path)
+            text_content, page_count, empty_pages, total_images = self._extract_text_fallback(pdf_path)
+            total_drawings = 0
+            total_widgets = 0
 
         if page_count == 0:
             return True
         if empty_pages > page_count * threshold:
             return True
-        if len(text_content.strip()) < min_text:
+
+        # Only enforce min_text if the document lacks visual content (no images, drawings, or form widgets).
+        # Legitimate scanned pages, certificates, diagrams, or visual documents naturally have little or no text.
+        has_visual_data = (total_images > 0) or (total_drawings > 0) or (total_widgets > 0)
+        if not has_visual_data and len(text_content.strip()) < min_text:
             return True
+
         return False
 
     def _extract_text_fallback(self, pdf_path):
-        """Best-effort text, page count, and empty-page count when PyMuPDF
-        isn't available.
-
-        Prefers PyPDF2 because it can iterate pages individually, giving a
-        real page count and a real empty-page count (needed for the
-        empty-page-ratio check) rather than one blob of text for the whole
-        document. Falls back to pdfminer only for the min-text-length part
-        of the check if PyPDF2 isn't installed either — pdfminer's simple
-        API doesn't expose an efficient per-page count, so in that case the
-        whole document is treated as a single "page" and the empty-page-ratio
-        check is effectively a no-op (documented here rather than silently
-        skipped)."""
+        """Best-effort text, page count, empty-page count, and image count when PyMuPDF
+        isn't available."""
         if PYPDF2_AVAILABLE:
             try:
                 with open(pdf_path, "rb") as f:
                     reader = PdfReader(f)
                     page_count = len(reader.pages)
                     if page_count == 0:
-                        return "", 0, 0
+                        return "", 0, 0, 0
                     text_content = ""
                     empty_pages = 0
+                    total_images = 0
                     for page in reader.pages:
                         if not self.running:
-                            # Cancelled mid-file — return what's been read so
-                            # far; the caller discards this result anyway.
-                            return text_content, page_count, empty_pages
+                            return text_content, page_count, empty_pages, total_images
+                        page_text = ""
                         try:
                             page_text = page.extract_text() or ""
                         except Exception:
                             page_text = ""
-                        if page_text.strip():
+                        page_images = 0
+                        try:
+                            page_images = len(page.images)
+                        except Exception:
+                            pass
+                        total_images += page_images
+                        has_content = bool(page_text.strip()) or (page_images > 0)
+                        if has_content:
                             text_content += page_text
                         else:
                             empty_pages += 1
-                    return text_content, page_count, empty_pages
+                    return text_content, page_count, empty_pages, total_images
             except Exception:
                 pass
 
         if PDFMINER_AVAILABLE:
             try:
                 text = pdfminer_extract_text(pdf_path) or ""
-                # No cheap per-page count available here; treat the whole
-                # document as one unit so only the min-text-length check
-                # is meaningful in this path.
                 page_count = 1 if text.strip() else 0
                 empty_pages = 0 if text.strip() else 1
-                return text, page_count, empty_pages
+                return text, page_count, empty_pages, 0
             except Exception:
                 pass
 
-        return "", 0, 0
+        return "", 0, 0, 0
 
 
 if __name__ == "__main__":
