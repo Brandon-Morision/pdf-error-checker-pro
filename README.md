@@ -4,6 +4,16 @@ A professional desktop application for scanning and validating PDF files across 
 
 ## What's new in this update
 
+- 🛡️ **Scope-aware scan caching** — Cache pruning is now strictly scoped to the folder(s) actively scanned in the current session. Scanning a single folder no longer purges cached entries for other folders checked in earlier sessions, preserving cache benefits across diverse project directories.
+- 🧬 **Timeout-protected parallel duplicate hashing** — Duplicate detection now hashes unhashed files concurrently using a worker thread pool protected by the configured per-file timeout, preventing oversized or slow-to-read PDFs from stalling the duplicate check indefinitely.
+- 🔒 **UI state protection during scans** — Browse, Settings, and History controls are now automatically disabled during an active scan alongside the Scan and Export buttons. This prevents race conditions, conflicting threshold changes, or in-memory cache resets while background worker threads are running.
+- ⏱️ **Auto-update installer safety timeout** — The Windows executable self-replacement batch script now caps process-exit wait attempts to 30 seconds. If an external lock (e.g. antivirus) prevents file replacement, it times out gracefully with a clear message and leaves the downloaded update in place instead of looping indefinitely in the background.
+- 🖱️ **Smoother sidebar mousewheel scrolling** — Refined mousewheel event bindings on the left sidebar to eliminate duplicate events across nested child widgets, fixing double-speed scrolling while preserving native wheel interaction on numeric spinboxes.
+- 🔍 **Strict structural inspection for "Missing Information"** — Unexpected exceptions encountered during PyMuPDF content inspection now flag the file for review instead of silently passing it as clean, ensuring structurally damaged or unreadable documents are surfaced alongside corrupt and password-protected files.
+- 📋 **Updated About dialog overview** — The in-app About tab now lists all modern capabilities including parallel workers, per-file timeouts, duplicate detection, history logs, and profile management.
+
+## Previous updates
+
 - ⚡ **Parallel scanning** — files are now checked concurrently with a configurable worker pool (Settings → Scan Settings → Performance), instead of one at a time, so large folders scan noticeably faster on multi-core machines.
 - ⏱️ **Per-file timeout guard** — a single huge or malformed PDF can no longer stall the whole scan; if one file takes longer than the configured timeout, it's flagged `Scan Timeout` and the scan moves on.
 - 💾 **Skip-unchanged-files caching** — re-scanning the same tree after fixing a handful of files reuses cached results for anything whose size and modified-time haven't changed, instead of re-checking everything. Toggle or clear it under Settings → General.
@@ -18,9 +28,6 @@ A professional desktop application for scanning and validating PDF files across 
 - 📱 **Scrollable sidebar & small-screen support** — the left sidebar is now scrollable via mousewheel or vertical scrollbar, and window startup dimensions auto-clamp to fit smaller displays (such as 1366x768 or 1536x864 at 125% scaling) so action buttons are never pushed off-screen.
 - 🎯 **Accurate content detection for "Missing Information"** — pages containing embedded raster images, vector graphics/drawings, or interactive form widgets are no longer falsely treated as empty, preventing legitimate scanned documents, certificates, and diagrams from triggering false positives.
 - 🔬 **Smart DPI calculation for "Not Clear"** — resolution is now computed against each image's actual rendered bounding box on the page rather than entire page dimensions. Thin decorative rules, gradient lines, and separator strips (< 0.5" or aspect ratio > 15:1) are filtered out, standard nominal screen-resolution graphics (72 DPI) are protected with a tolerance margin, and pages with rich native digital text distinguish standard on-screen graphics (≥ 70 DPI) from low-resolution scans (which strictly enforce the configured DPI threshold).
-
-## Previous update
-
 - 📁 **Flexible folder matching** — subfolder names are no longer hardcoded to `open`/`confidential`. Matching is now case-insensitive, a project folder only needs *one* of the target subfolders (not both), and common naming variations (`opened`, `public`, `conf`, `restricted`, `private`, etc.) are recognized automatically. Target names are configurable in Settings → Scan Settings.
 - 🗂️ **Scan Mode toggle** — choose **Project Structure** (the folder-matching behavior above) or **All PDFs (Recursive)**, which ignores subfolder naming entirely and scans every PDF under the selected folder.
 - 🔀 **Sortable, filterable results table** — results now show in a proper table (file, parent folder, subfolder, errors) instead of a plain text log. Click any column header to sort; type in the filter box to narrow results live.
@@ -37,17 +44,18 @@ A professional desktop application for scanning and validating PDF files across 
 
 - 🔍 **Multi-folder scanning** — recursively finds project folders containing your configured target subfolders (default: 'open' and 'confidential'), matched case-insensitively and tolerant of naming variations
 - 🗂️ **Two scan modes** — strict Project Structure matching, or All PDFs (Recursive) to scan everything under a folder regardless of naming
-- ⚡ **Parallel, cached processing** — a configurable worker pool checks files concurrently, with per-file timeouts and a skip-unchanged-files cache for fast re-scans
-- 🔑 **Password & duplicate detection** — encrypted PDFs and files that appear more than once (by content hash) are flagged as their own error types
+- ⚡ **Parallel, cached processing** — a configurable worker pool checks files concurrently, with per-file timeouts and a scope-aware, skip-unchanged-files cache for fast re-scans across multiple sessions
+- 🧬 **Password & duplicate detection** — encrypted PDFs and files that appear more than once (by content hash, with parallel timeout-guarded processing) are flagged as their own error types
 - 🔀 **Sortable, filterable results table** — click-to-sort columns and a live filter box
 - 🖱️ **One-click file access** — double-click or right-click any result to open it or reveal it on disk
 - 📊 **Detailed reports** — export a professional Word document with error summaries, with optional auto-open
 - 🗒️ **Scan history** — a local log of past runs (date, folder, mode, files, errors, duration)
 - 🧾 **Scan profiles** — save/load named threshold sets per client or project type
+- 🔒 **UI state protection** — controls are automatically locked during scans to safeguard settings and cached state
 - 🔔 **Desktop notifications** when a scan finishes
 - ⚙️ **Configurable** — settings dialog with persistent configuration (DPI threshold, text-length threshold, empty-page ratio, window size, auto-update toggle, parallel workers, per-file timeout, scan cache)
 - 🎨 **Modern UI** — clean interface with custom rounded-corner controls, tooltips, and friendly empty states throughout
-- 🔄 **In-app auto-updates** — automatic startup check against GitHub releases with background downloading, progress display, and seamless self-restarting installation
+- 🔄 **In-app auto-updates** — automatic startup check against GitHub releases with background downloading, progress display, and seamless self-restarting installation with timeout guards
 
 
 ## Installation
@@ -117,7 +125,7 @@ When a scan finishes, the app sends a non-blocking desktop notification via the 
 
 On startup, the app checks this repository's latest GitHub release. If a newer version is found, it opens an **Update Available** dialog with the release notes and one of two actions:
 
-- If the release has a compatible downloadable asset (a `.exe` when running as a built app, or a `.py` when running from source), you'll see **Download & Install**: the app downloads it in the background with a progress dialog, then — after you confirm — closes and restarts itself with the new version already in place. On Windows, this works by handing off to a small helper script that waits for the app to fully exit, replaces the executable, and relaunches it (the standard pattern most self-updating desktop apps use, since Windows won't let a running `.exe` overwrite itself directly). Running from source, the script file is replaced directly and the app relaunches via a fresh Python process; a `.bak` copy of the previous version is kept alongside it.
+- If the release has a compatible downloadable asset (a `.exe` when running as a built app, or a `.py` when running from source), you'll see **Download & Install**: the app downloads it in the background with a progress dialog, then — after you confirm — closes and restarts itself with the new version already in place. On Windows, this works by handing off to a small helper script that waits for the app to fully exit, replaces the executable, and relaunches it (capped at 30 seconds to prevent indefinite background hangs if locked by antivirus). Running from source, the script file is replaced directly and the app relaunches via a fresh Python process; a `.bak` copy of the previous version is kept alongside it.
 - If no compatible asset is found for your platform/build, you'll instead see **Open Release Page**, which opens the release in your browser so you can download it manually.
 
 You can disable the startup check entirely under Settings → General.

@@ -377,10 +377,36 @@ class ScanCache:
             "errors": errors, "hash": file_hash,
         }
 
-    def prune_missing(self, valid_paths):
-        """Drop entries for files no longer in scope, so the cache file
-        doesn't grow forever as folders are renamed or files move/delete."""
-        stale = [p for p in self.data if p not in valid_paths]
+    def prune_missing(self, valid_paths, scanned_roots=None):
+        """Drop cache entries for files no longer present, so the cache
+        file doesn't grow forever as folders are renamed or files move or
+        get deleted.
+
+        Only entries that live under one of `scanned_roots` (the folder(s)
+        actually walked in this scan) are eligible for pruning — anything
+        outside those roots belongs to a *different* previously-scanned
+        folder and must be left untouched. Without this restriction,
+        scanning folder A would wipe every cached entry for folder B, C,
+        etc. from earlier sessions, since they're naturally not in this
+        run's `valid_paths`.
+        """
+        if not scanned_roots:
+            # No root info available — be conservative and prune nothing
+            # rather than risk deleting entries for folders outside scope.
+            return
+        normalized_roots = [os.path.normcase(os.path.normpath(r)) for r in scanned_roots]
+
+        def _under_scanned_roots(path):
+            norm_path = os.path.normcase(os.path.normpath(path))
+            return any(
+                norm_path == root or norm_path.startswith(root + os.sep)
+                for root in normalized_roots
+            )
+
+        stale = [
+            p for p in self.data
+            if p not in valid_paths and _under_scanned_roots(p)
+        ]
         for p in stale:
             del self.data[p]
 
@@ -1034,10 +1060,15 @@ class SettingsDialog(tk.Toplevel):
         desc_text = ("A professional tool for scanning and validating PDF files\n"
                     "across multiple project folders.\n\n"
                     "Features:\n"
-                    "- Multi-folder recursive scanning\n"
-                    "- Thread-safe background processing\n"
+                    "- Multi-folder recursive scanning (project-structure or all-PDFs mode)\n"
+                    "- Thread-safe, parallel background processing with per-file timeouts\n"
+                    "- Scan result caching, so unchanged files aren't re-checked\n"
+                    "- Duplicate-file detection across scanned folders\n"
+                    "- Password-protection detection\n"
+                    "- Scan history log\n"
+                    "- Saveable scan profiles\n"
                     "- Professional Word report export\n"
-                    "- Automatic update checking\n"
+                    "- Automatic update checking (with optional auto-install)\n"
                     "- Modern UI with rounded corners")
         tk.Label(info_frame, text=desc_text, font=("Segoe UI", 10), bg="#ffffff", fg="#34495e",
                  justify=tk.CENTER).pack(pady=(0, 20))
@@ -1387,15 +1418,31 @@ class PDFErrorChecker:
         a tiny helper batch script that: waits for the current process to
         release its file lock, moves the new exe into place, relaunches it,
         then deletes itself. We hand off to that script and exit — this is
-        the standard self-update pattern used by many Windows desktop apps."""
+        the standard self-update pattern used by many Windows desktop apps.
+
+        The wait loop is capped (WAIT_ATTEMPTS) rather than looping forever:
+        if the old exe can never be deleted (locked by AV, permissions,
+        etc.) the script gives up and leaves the downloaded update in place
+        with a visible message, instead of spinning silently in the
+        background indefinitely.
+        """
         current_exe = Path(sys.executable)
         new_exe_path = Path(new_exe_path)
         batch_path = Path(tempfile.gettempdir()) / "pdf_checker_update.bat"
+        wait_attempts = 30  # ~30 seconds at 1s per attempt
 
         batch_script = f"""@echo off
+set ATTEMPTS=0
 :wait_loop
 del "{current_exe}" >NUL 2>&1
 if exist "{current_exe}" (
+    set /a ATTEMPTS+=1
+    if %ATTEMPTS% GEQ {wait_attempts} (
+        echo Could not replace "{current_exe}" - it may still be running or locked.
+        echo The downloaded update is still available at "{new_exe_path}".
+        pause
+        exit /b 1
+    )
     timeout /t 1 /nobreak >NUL
     goto wait_loop
 )
@@ -1520,17 +1567,17 @@ start "" "{current_exe}"
             if left_canvas.winfo_height() < left_panel.winfo_reqheight():
                 left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        def _bind_mousewheel_tree(widget):
-            widget.bind("<MouseWheel>", _on_left_mousewheel, add="+")
-            for child in widget.winfo_children():
-                _bind_mousewheel_tree(child)
-
         self.setup_folder_selection(left_panel)
         self.setup_scan_mode(left_panel)
         self.setup_scan_options(left_panel)
         self.setup_action_buttons(left_panel)
 
-        _bind_mousewheel_tree(left_panel)
+        # Bound only on the canvas/container themselves (while the pointer
+        # is over the left panel) rather than recursively on every child
+        # widget too — binding it on both would fire the handler twice per
+        # wheel tick when the cursor was over a child, scrolling roughly
+        # twice as fast as everywhere else. It's also skipped on Spinboxes
+        # so their native mousewheel value-stepping still works normally.
         left_canvas.bind("<MouseWheel>", _on_left_mousewheel)
         left_container.bind("<MouseWheel>", _on_left_mousewheel)
         left_container.bind("<Enter>", lambda _e: self.root.bind_all("<MouseWheel>", _on_left_mousewheel))
@@ -1558,10 +1605,10 @@ start "" "{current_exe}"
                                      bg="#ecf0f1", fg="#2c3e50", relief=tk.FLAT, state="readonly")
         self.folder_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        browse_btn = RoundedButton(folder_entry_frame, text="Browse", command=self.browse_folder,
+        self.browse_button = RoundedButton(folder_entry_frame, text="Browse", command=self.browse_folder,
                                    bg="#3498db", fg="white", font=("Segoe UI", 9, "bold"),
                                    width=100, height=35)
-        browse_btn.pack(side=tk.RIGHT, padx=(10, 0))
+        self.browse_button.pack(side=tk.RIGHT, padx=(10, 0))
 
     def setup_scan_mode(self, parent):
         mode_frame = tk.LabelFrame(parent, text="Scan Mode", font=("Segoe UI", 11, "bold"),
@@ -2037,6 +2084,9 @@ start "" "{current_exe}"
         # Reload from disk: picks up a "Clear Cache" click, and ensures any
         # changed thresholds are reflected the next time the cache is
         # consulted (a stale in-memory copy could otherwise mask a clear).
+        # Settings is only reachable while self.running is False (see
+        # _set_controls_enabled_during_scan), so there's no risk of this
+        # replacing a cache object a scan thread is actively writing to.
         self.scan_cache = ScanCache()
 
     def browse_folder(self):
@@ -2260,18 +2310,38 @@ start "" "{current_exe}"
         self.clear_results()
         self.has_scanned = True
         self.results = []
-
-        if self.scan_button:
-            self.scan_button.config(state=tk.DISABLED)
-        if self.cancel_button:
-            self.cancel_button.config(state=tk.NORMAL)
-        if self.export_button:
-            self.export_button.config(state=tk.DISABLED)
+        self._set_controls_enabled_during_scan(False)
 
         self.scan_thread = threading.Thread(
             target=self.run_scan, args=(valid_folders, scan_mode, folder_matches), daemon=True
         )
         self.scan_thread.start()
+
+    def _set_controls_enabled_during_scan(self, enabled):
+        """Browse/Settings/History all read or touch self.settings and
+        self.scan_cache, both of which are actively used by the worker
+        threads while a scan is running. Letting the user open Settings
+        mid-scan lets later files get checked against different thresholds
+        than earlier ones in the SAME run, and Settings additionally
+        replaces self.scan_cache wholesale on close — discarding any
+        results the in-progress scan has cached so far but not yet
+        persisted. Disabling these for the duration of a scan avoids both.
+        Browse is included too since changing the target folder mid-scan
+        would be equally confusing, even though it doesn't touch shared
+        state the same way."""
+        state = tk.NORMAL if enabled else tk.DISABLED
+        if self.scan_button:
+            self.scan_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        if self.cancel_button:
+            self.cancel_button.config(state=tk.DISABLED if enabled else tk.NORMAL)
+        if self.export_button:
+            self.export_button.config(state=tk.DISABLED)
+        if hasattr(self, "browse_button"):
+            self.browse_button.config(state=state)
+        if self.settings_button:
+            self.settings_button.config(state=state)
+        if self.history_button:
+            self.history_button.config(state=state)
 
     def run_scan(self, valid_folders, scan_mode="project", folder_matches=None):
         check_cannot_open = self.check_cannot_open.get()
@@ -2436,10 +2506,16 @@ start "" "{current_exe}"
 
         if check_duplicates and self.running:
             self.root.after(0, lambda: self.status_label.config(text="Checking for duplicates..."))
-            self._detect_duplicates(all_pdfs)
+            self._detect_duplicates(all_pdfs, per_file_timeout)
 
         try:
-            self.scan_cache.prune_missing({p["path"] for p in all_pdfs})
+            # Fixed: previously pruned any cache entry not in this run's
+            # all_pdfs, with no notion of scope — scanning folder A would
+            # wipe cached entries for folder B, C, etc. from earlier
+            # sessions, since those are naturally absent from this run's
+            # path list. Passing valid_folders restricts pruning to files
+            # that live under the folder(s) actually scanned this time.
+            self.scan_cache.prune_missing({p["path"] for p in all_pdfs}, scanned_roots=valid_folders)
             self.scan_cache.save()
         except Exception as e:
             logger.warning(f"Failed to persist scan cache: {e}")
@@ -2492,18 +2568,43 @@ start "" "{current_exe}"
 
         return errors, file_hash, False
 
-    def _detect_duplicates(self, all_pdfs):
+    def _detect_duplicates(self, all_pdfs, per_file_timeout=30):
         """Groups files by content hash (computed during the main pass, or
         here if that step was skipped/cached without one) and flags any
         file whose exact content also appears elsewhere in this scan —
-        e.g. the same PDF present in both 'open' and 'confidential'."""
+        e.g. the same PDF present in both 'open' and 'confidential'.
+
+        Hashing any files that don't already have one (e.g. those that hit
+        'Scan Timeout' earlier, or came from a cache hit recorded without a
+        hash) happens on a small thread pool with the same per-file timeout
+        used during the main pass — otherwise one huge or slow-to-read file
+        at this stage could stall the whole 'Checking for duplicates...'
+        phase indefinitely, bypassing the protection the main scan already
+        has."""
+        needs_hash = [p for p in all_pdfs if p.get("_hash") is None]
+        if needs_hash:
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix="pdfhash") as executor:
+                future_map = {
+                    executor.submit(self._hash_file, p["path"]): p
+                    for p in needs_hash
+                }
+                for future, pdf_info in future_map.items():
+                    if not self.running:
+                        break
+                    try:
+                        pdf_info["_hash"] = future.result(timeout=per_file_timeout)
+                    except FuturesTimeoutError:
+                        logger.warning(f"Duplicate-check hash timed out: {pdf_info['path']}")
+                        pdf_info["_hash"] = None
+                    except Exception as e:
+                        logger.warning(f"Duplicate-check hash failed for {pdf_info['path']}: {e}")
+                        pdf_info["_hash"] = None
+
         hash_map = {}
         for pdf_info in all_pdfs:
             if not self.running:
                 return
             file_hash = pdf_info.get("_hash")
-            if file_hash is None:
-                file_hash = self._hash_file(pdf_info["path"])
             if file_hash is None:
                 continue
             hash_map.setdefault(file_hash, []).append(pdf_info)
@@ -2581,10 +2682,7 @@ start "" "{current_exe}"
         # to avoid re-sorting on every single new result.
         self._refresh_results_tree()
 
-        if self.scan_button:
-            self.scan_button.config(state=tk.NORMAL)
-        if self.cancel_button:
-            self.cancel_button.config(state=tk.DISABLED)
+        self._set_controls_enabled_during_scan(True)
         if self.export_button:
             self.export_button.config(state=tk.NORMAL if self.results else tk.DISABLED)
 
@@ -2603,10 +2701,7 @@ start "" "{current_exe}"
 
     def scan_complete(self):
         self.running = False
-        if self.scan_button:
-            self.scan_button.config(state=tk.NORMAL)
-        if self.cancel_button:
-            self.cancel_button.config(state=tk.DISABLED)
+        self._set_controls_enabled_during_scan(True)
 
     def check_pdf(self, pdf_path, check_cannot_open, check_not_clear, check_missing_info,
                   check_password_protected, resolution_threshold):
@@ -2830,8 +2925,16 @@ start "" "{current_exe}"
                         empty_pages += 1
                 doc.close()
             except Exception as e:
+                # Fixed: this used to `return False` (treat the file as
+                # fine) on an inspection failure, which is inconsistent
+                # with is_pdf_corrupt() and is_pdf_password_protected() —
+                # both of which flag the file when they can't be sure. A
+                # PyMuPDF exception mid-inspection usually means something
+                # is actually wrong with the file's structure, which is
+                # exactly the kind of thing this tool exists to surface,
+                # not silently pass as clean.
                 logger.warning(f"Could not inspect content of {pdf_path}: {e}")
-                return False
+                return True
         else:
             text_content, page_count, empty_pages, total_images = self._extract_text_fallback(pdf_path)
             total_drawings = 0
