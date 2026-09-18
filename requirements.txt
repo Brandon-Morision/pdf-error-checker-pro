@@ -1,4 +1,5 @@
-# --- Core (the app cannot start without this) ---
+# --- Core (the app cannot start without these) ---
+PySide6>=6.6.0
 requests>=2.31.0
 
 # --- Recommended (the app runs without these, but scan accuracy and
@@ -9,9 +10,12 @@ PyPDF2>=3.0.0            # corrupt-file check fallback + "missing information" f
 pdfminer.six>=20221105   # last-resort text extraction if PyMuPDF and PyPDF2 are both missing
 python-docx>=1.1.0       # required only for the "Export to Word" report
 
-# --- Optional (small UI/UX extras — app works fully without them) ---
-Pillow>=10.0.0           # smoother About-tab icon resizing (a plain PNG loader is used without it)
-plyer>=2.1.0             # non-blocking desktop notification on scan completion (falls back to a popup without it)
-
 # --- Build tooling only (not imported by the app itself, only needed for build_exe.bat) ---
 pyinstaller>=6.0.0
+
+# --- No longer needed as of Version 2 (Qt Edition) ---
+# Pillow — Version 1 (Tkinter) used this for About-tab icon resizing;
+#          Qt's QIcon loads PNG/ICO natively, so this dependency is gone.
+# plyer  — Version 1 (Tkinter) used this for desktop notifications;
+#          Qt's built-in QSystemTrayIcon replaces it, so this dependency
+#          is gone too.
